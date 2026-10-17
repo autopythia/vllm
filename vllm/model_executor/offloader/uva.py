@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """UVA-based CPU offloading using Unified Virtual Addressing."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import nullcontext
 
 import torch
@@ -70,6 +70,44 @@ class UVAOffloader(BaseOffloader):
                 format_gib(self.cpu_offload_bytes),
             )
         return modules
+
+    def place_cpu_built_modules(
+        self,
+        modules: Iterable[nn.Module],
+        prefix: str = "",
+        device: torch.device | str = "cuda",
+    ) -> None:
+        """Counterpart of wrap_modules for modules that were constructed on the
+        CPU (because they are too large to stage on the device first): the
+        parameters selected by cpu_offload_params go to pinned host memory with
+        a UVA view, as wrap_modules would leave them; all other parameters and
+        all buffers move to `device`."""
+        if prefix:
+            prefix = f"{prefix}."
+        for module in modules:
+            for name, p in module.named_parameters():
+                offload = (
+                    self.uva_offloading
+                    and self.cpu_offload_bytes < self.cpu_offload_max_bytes
+                    and any(
+                        f".{param}." in f".{prefix}{name}."
+                        for param in self.cpu_offload_params
+                    )
+                )
+                if offload:
+                    cpu_data = p.data.pin_memory() if self.pin_memory else p.data
+                    p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
+                    p._vllm_is_uva_offloaded = True
+                    self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
+                else:
+                    p.data = p.data.to(device)
+            for sub in module.modules():
+                for bname, buf in list(sub._buffers.items()):
+                    if buf is not None:
+                        sub._buffers[bname] = buf.to(device)
+        logger.info(
+            "Total CPU offloaded parameters: %s", format_gib(self.cpu_offload_bytes)
+        )
 
     def _maybe_offload_to_cpu(self, module: nn.Module, prefix: str = "") -> nn.Module:
         """Offload module parameters to CPU using UVA if budget allows."""

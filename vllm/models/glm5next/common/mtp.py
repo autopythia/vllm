@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import typing
 from collections.abc import Callable, Iterable
 
@@ -25,6 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -122,22 +124,44 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         config = vllm_config.model_config.hf_text_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        self.layers = torch.nn.ModuleDict(
-            {
-                str(idx): Glm5NextMultiTokenPredictorLayer(
-                    vllm_config, f"{prefix}.layers.{idx}"
-                )
-                for idx in range(
-                    self.mtp_start_layer_idx,
-                    self.mtp_start_layer_idx + self.num_mtp_layers,
-                )
-            }
+        # The MTP layers are built outside make_layers, so they are routed through
+        # the offloader here (as the target's embed_tokens): e.g.
+        # --cpu-offload-params mtp_block.mlp.experts keeps the routed experts
+        # (bf16, ~13 GiB) in pinned host memory (UVA). wrap_modules only moves a
+        # module after it was built on the GPU, which needs room for the whole
+        # layer, so when the offload targets the MTP block the layers are built
+        # on the CPU and then placed (offloaded parameters stay in host memory).
+        offloader = get_offloader()
+        build_on_cpu = getattr(offloader, "uva_offloading", False) and any(
+            p.startswith("mtp_block") for p in getattr(offloader, "cpu_offload_params", ())
         )
+        with torch.device("cpu") if build_on_cpu else contextlib.nullcontext():
+            self.layers = torch.nn.ModuleDict(
+                {
+                    str(idx): Glm5NextMultiTokenPredictorLayer(
+                        vllm_config, f"{prefix}.layers.{idx}"
+                    )
+                    for idx in range(
+                        self.mtp_start_layer_idx,
+                        self.mtp_start_layer_idx + self.num_mtp_layers,
+                    )
+                }
+            )
+        if build_on_cpu:
+            offloader.place_cpu_built_modules(
+                self.layers.values(), prefix="mtp", device=current_platform.device_type
+            )
+        elif offloader.supports_tower_offload:
+            offloader.wrap_modules(iter(self.layers.values()), prefix="mtp")
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        # The drafter's own embedding table (used on PP ranks that do not hold the
+        # target's): --cpu-offload-params embed_tokens.
+        if offloader.supports_tower_offload:
+            offloader.wrap_modules(iter([self.embed_tokens]), prefix="embed_tokens")
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
