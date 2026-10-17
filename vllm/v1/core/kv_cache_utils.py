@@ -2684,6 +2684,17 @@ def get_kv_cache_configs(
             vllm_config.parallel_config.decode_context_parallel_size,
         )
 
+    max_worker_bytes_per_block = max(
+        (
+            cfg.kv_cache_tensors[0].size // cfg.num_blocks
+            for cfg in kv_cache_configs
+            if cfg.kv_cache_tensors and cfg.num_blocks > 0
+        ),
+        default=None,
+    )
+    for kv_cache_config in kv_cache_configs:
+        kv_cache_config.max_worker_bytes_per_block = max_worker_bytes_per_block
+
     return kv_cache_configs
 
 

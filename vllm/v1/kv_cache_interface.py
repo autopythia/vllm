@@ -1492,6 +1492,11 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
+    max_worker_bytes_per_block: int | None = None
+    """Largest pool bytes per block among all workers. Pipeline stages own
+    different layers, so this can exceed this worker's own bytes per block;
+    host-side layouts shared by all workers use it as the per-worker slot."""
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""
