@@ -82,6 +82,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -727,6 +728,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            # Built outside make_layers, so route it through the offloader here
+            # (as vLLM does for multimodal towers): with --cpu-offload-gb and
+            # --cpu-offload-params embed_tokens the table stays in pinned host
+            # memory (UVA) and a lookup reads hidden_size * 2 bytes per token.
+            offloader = get_offloader()
+            if offloader.supports_tower_offload:
+                offloader.wrap_modules(iter([self.embed_tokens]), prefix="embed_tokens")
         else:
             self.embed_tokens = PPMissingLayer()
 
