@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_INDEXER_PREFILL_BUFFER_TOKENS: int = 0
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1117,6 +1118,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Opt-in size, in tokens, of the sparse MLA indexer's prefill K-gather
+    # workspace (rounded up to max_model_len so one request always fits).
+    # 0 keeps the default, which is sized to share the flashmla_sparse prefill
+    # workspace: 8 * factor * max_model_len tokens (factor 5 up to 256K, else
+    # 2), i.e. 16-40x what one request needs. Larger prefill batches are split
+    # into more indexer chunks when the workspace is smaller.
+    "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_TOKENS": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_TOKENS", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

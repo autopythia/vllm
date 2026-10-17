@@ -917,6 +917,10 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
+    if envs.VLLM_SPARSE_INDEXER_PREFILL_BUFFER_TOKENS > 0:
+        # Opt-in: size for the tokens the indexer actually gathers (at least one
+        # max-length request) instead of filling the flashmla_sparse workspace.
+        return max(envs.VLLM_SPARSE_INDEXER_PREFILL_BUFFER_TOKENS, max_model_len)
     factor = vllm_config.attention_config.sparse_mla_prefill_workspace_factor
     assert factor is not None
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
