@@ -1593,6 +1593,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.pending_spec_token_ids = None
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -2196,6 +2197,16 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
+            if request.pending_spec_token_ids is not None:
+                # Drafts proposed by the step just processed (see
+                # update_draft_token_ids); valid now that its tokens are in.
+                pending = request.pending_spec_token_ids
+                request.pending_spec_token_ids = None
+                if not stopped and not output_is_stale:
+                    request.spec_token_ids = (
+                        self.structured_output_manager.validate_tokens(request, pending)
+                    )
+
             routed_experts = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
@@ -2561,6 +2572,16 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                continue
+
+            if request.num_computed_tokens >= request.num_tokens:
+                # The step that proposed these drafts is still in flight: with
+                # a batch queue (pipeline parallelism) and no async scheduling,
+                # the engine takes the drafts right after scheduling the step,
+                # before update_from_output has appended its sampled token.
+                # Scheduling them now would send the drafts without that token
+                # (num_new_tokens == num_drafts). Apply them in update_from_output.
+                request.pending_spec_token_ids = spec_token_ids
                 continue
 
             # Add newly generated spec token ids to the request.
