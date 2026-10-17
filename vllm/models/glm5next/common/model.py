@@ -770,6 +770,19 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # With mHC, the stream crossing a PP boundary is the completed
+        # (num_tokens, hc_mult, hidden_size) residual; see forward().
+        if self.config.mhc:
+            shape = (batch_size, self.config.hc_mult, self.config.hidden_size)
+        else:
+            shape = (batch_size, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def _aux_hidden_state(
         self,
         hidden_states: torch.Tensor,
@@ -809,9 +822,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            # mHC: the previous rank completed its deferred hc_post, so the
+            # first local layer runs a standalone hc_pre on the widened stream.
+            residual = None
             post = None
             comb = None
 
@@ -833,14 +846,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            if post is not None:
+                assert residual is not None and comb is not None
+                hidden_states = self._aux_post_op(hidden_states, residual, post, comb)
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = self._aux_hidden_state(hidden_states, residual, post, comb)
@@ -1069,6 +1078,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1231,10 +1243,9 @@ class Glm5NextForConditionalGeneration(
             )
 
         self.set_moe_parameters()
-
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
