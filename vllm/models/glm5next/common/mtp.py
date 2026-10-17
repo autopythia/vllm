@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -361,6 +362,23 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 name = name.replace("model.language_model.", "model.", 1)
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                # The drafter's input embedding is normally the target's, shared
+                # after loading (maybe_share_target_embed). With pipeline
+                # parallelism the drafter runs on the last stage, which has no
+                # target embedding, and the sharing step returns early: load the
+                # drafter's own copy from the checkpoint instead of leaving it
+                # uninitialized.
+                if (
+                    name == "model.embed_tokens.weight"
+                    and get_pp_group().world_size > 1
+                    and name in params_dict
+                ):
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
             if self.is_fused_shared_expert_enabled:
