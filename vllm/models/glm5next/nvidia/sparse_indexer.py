@@ -29,6 +29,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import has_deep_gemm
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -95,6 +96,73 @@ def _kpool_compress_insert(
         write_cache=True,
         return_compressed=False,
     )
+
+
+def _maybe_sort_topk_(topk: torch.Tensor) -> None:
+    """Give the top-k selection a fixed order (padding last).
+
+    The radix top-k kernels emit the selected set in an order that depends on
+    atomics, and sparse attention accumulates in index order, so without this
+    identical requests can differ run-to-run once top-k actually selects.
+    """
+    if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK:
+        topk.copy_(topk.sort(dim=-1, descending=True).values)
+
+
+def _deterministic_topk_prefill_(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Drop-in for ``top_k_per_row_prefill`` (indices relative to each row's
+    start, -1 padding) whose choice among exact ties at the top-k boundary is
+    deterministic (torch.topk) instead of decided by atomics. Masks ``logits``
+    outside each row's range in place.
+    """
+    if logits.shape[0] == 0:
+        return
+    starts = row_starts.unsqueeze(1).long()
+    if logits.stride(1) == 1:
+        # In place and without [M, N] temporaries (a bool mask would add 0.75x
+        # the logits size at the chunker's logits cap).
+        _fill_outside_rows_kernel[(logits.shape[0],)](
+            logits,
+            logits.stride(0),
+            row_starts,
+            row_ends,
+            logits.shape[1],
+            BLOCK=1024,
+        )
+    else:
+        cols = torch.arange(logits.shape[1], device=logits.device)
+        logits.masked_fill_(
+            (cols < starts) | (cols >= row_ends.unsqueeze(1)), float("-inf")
+        )
+    k = min(out.shape[1], logits.shape[1])
+    vals, idx = logits.topk(k, dim=1, sorted=False)
+    out.fill_(-1)
+    out[:, :k] = torch.where(vals == float("-inf"), -1, idx - starts).to(out.dtype)
+
+
+@triton.jit(do_not_specialize=["stride", "starts_ptr", "ends_ptr", "n_cols"])
+def _fill_outside_rows_kernel(
+    logits_ptr, stride, starts_ptr, ends_ptr, n_cols, BLOCK: tl.constexpr
+):
+    """logits[row, c] = -inf for c < starts[row] or c >= ends[row]; one program
+    per row, touching only the columns outside the row's range."""
+    row = tl.program_id(0)
+    start = tl.load(starts_ptr + row).to(tl.int64)
+    end = tl.maximum(tl.load(ends_ptr + row).to(tl.int64), start)
+    n = n_cols.to(tl.int64)
+    base = logits_ptr + row.to(tl.int64) * stride
+    offs = tl.arange(0, BLOCK)
+    for c0 in range(0, start, BLOCK):
+        cols = c0 + offs
+        tl.store(base + cols, float("-inf"), mask=cols < start)
+    for c0 in range(end, n, BLOCK):
+        cols = c0 + offs
+        tl.store(base + cols, float("-inf"), mask=cols < n)
 
 
 @eager_break_during_capture
@@ -373,6 +441,10 @@ def sparse_attn_indexer_kpool(
 
             if logits.shape[1] == 0:
                 topk_dst.fill_(-1)
+            elif envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK:
+                _deterministic_topk_prefill_(
+                    logits, cu_seqlen_ks, cu_seqlen_ke, topk_dst
+                )
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
@@ -394,6 +466,7 @@ def sparse_attn_indexer_kpool(
                 pool_cp_interleave,
                 row_starts=cu_seqlen_ks,
             )
+            _maybe_sort_topk_(topk_dst)
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -623,7 +696,9 @@ def sparse_attn_indexer_kpool(
         # honors kernel_config.sparse_indexer_topk_backend and picks between
         # cooperative/persistent by batch size instead of always taking the
         # same kernel.
-        get_indexer_topk(topk_backend)(
+        get_indexer_topk(
+            "torch" if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK else topk_backend
+        )(
             logits,
             seq_lens,
             next_n,
@@ -639,6 +714,7 @@ def sparse_attn_indexer_kpool(
             dcp_world_size,
             pool_cp_interleave,
         )
+        _maybe_sort_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:

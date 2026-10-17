@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_FLASHINFER_MOE_DETERMINISTIC: bool = False
+    VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -639,6 +640,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the GEMM2-epilogue fusion, whose atomics make results vary run-to-run.
     "VLLM_FLASHINFER_MOE_DETERMINISTIC": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_DETERMINISTIC", "0"))
+    ),
+    # Make the GLM-5.3 sparse indexer's top-k deterministic. The radix top-k
+    # kernels pick among exact ties at the top-k boundary and order their
+    # output by atomics, and sparse attention accumulates in index order, so
+    # results vary run-to-run. This selects with torch.topk (deterministic tie
+    # breaking) and emits each selection in a fixed order.
+    "VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK", "0"))
     ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
