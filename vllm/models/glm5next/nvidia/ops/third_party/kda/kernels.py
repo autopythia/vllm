@@ -770,7 +770,11 @@ def chunk_gla_fwd_o_gk(
     configs=[
         triton.Config({"BD": BD}, num_warps=num_warps)
         for BD in [32, 64]
-        for num_warps in [2, 4, 8]
+        # num_warps=2 spills to a ~6.4 KiB/thread stack frame. Launching it
+        # (even once, while autotuning) permanently grows the CUDA stack
+        # limit, which reserves stack for every resident thread on the GPU
+        # (~1.4 GiB on a 188-SM sm_120 part) outside the memory profile.
+        for num_warps in [4, 8]
     ],
     key=["H", "D", "BT", "IS_VARLEN"],
 )
