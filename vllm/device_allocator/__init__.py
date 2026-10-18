@@ -23,6 +23,9 @@ class AllocationData:
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
     is_asleep: bool = False
+    # Experiment (glm53-exp, VLLM_EXP_SLEEP_HOST_BACKUP): an exact-size host
+    # buffer that may outlive one sleep cycle; see cumem._HostBackup.
+    host_backup: object | None = None
 
 
 class MemAllocator(Protocol):

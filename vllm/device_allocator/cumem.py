@@ -10,6 +10,7 @@
 # the only successful approach is to call cuda driver API in C.
 import atexit
 import gc
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -83,6 +84,51 @@ def use_memory_pool_with_allocator(
     mem_pool = torch.cuda.memory.MemPool(new_alloc._allocator)
     with torch.cuda.memory.use_mem_pool(mem_pool):
         yield mem_pool, new_alloc
+
+
+def _host_backup_mode() -> str | None:
+    """Experiment (glm53-exp): VLLM_EXP_SLEEP_HOST_BACKUP=exact|keep."""
+    mode = os.environ.get("VLLM_EXP_SLEEP_HOST_BACKUP", "").strip().lower()
+    return mode if mode in ("exact", "keep") else None
+
+
+class _HostBackup:
+    """Exact-size, page-locked host copy of one allocation while asleep.
+
+    torch's pinned allocator rounds each block up to a power of two and caches
+    freed blocks: backing up ~89 GiB of weights held ~157 GiB of pinned host
+    memory per process (and pinned it at ~1.9 GB/s). This allocates pageable
+    memory of the exact size and registers it with cudaHostRegister (3.9 GB/s
+    measured), falling back to unpinned memory if registration fails.
+    """
+
+    __slots__ = ("tensor", "ptr", "registered", "valid")
+
+    def __init__(self, size: int) -> None:
+        self.tensor: torch.Tensor | None = torch.empty(
+            size, dtype=torch.uint8, device="cpu"
+        )
+        self.ptr = self.tensor.data_ptr()
+        self.registered = False
+        self.valid = False
+        if PIN_MEMORY and size > 0:
+            # cudaHostRegisterPortable: pinned for every context, so a helper
+            # thread with another current device can register it.
+            err = torch.cuda.cudart().cudaHostRegister(self.ptr, size, 1)
+            self.registered = int(err) == 0
+
+    def release(self) -> None:
+        if self.registered:
+            torch.cuda.cudart().cudaHostUnregister(self.ptr)
+            self.registered = False
+        self.tensor = None
+        self.valid = False
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
 
 
 class CuMemAllocator:
@@ -208,6 +254,9 @@ class CuMemAllocator:
         data = self.pointer_to_data.pop(ptr)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
+        if data.host_backup is not None:
+            data.host_backup.release()  # type: ignore[attr-defined]
+            data.host_backup = None
         if data.is_asleep and current_platform.is_rocm():
             # On ROCm, sleep() already unmapped and released this allocation's
             # physical chunks and holds its virtual address as a placeholder
@@ -251,7 +300,13 @@ class CuMemAllocator:
 
         total_bytes = 0
         backup_bytes = 0
+        reused_bytes = 0
         has_policy_conflict = False
+        host_backup_mode = _host_backup_mode()
+        prepare_thread = getattr(self, "_prepare_thread", None)
+        if prepare_thread is not None:
+            prepare_thread.join()  # host buffers being allocated by prepare_backup()
+            self._prepare_thread = None
 
         for ptr, data in self.pointer_to_data.items():
             if data.is_asleep:
@@ -265,15 +320,30 @@ class CuMemAllocator:
             if data.tag in offload_tags:
                 backup_bytes += handle[1]
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(
-                    size_in_bytes,
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=PIN_MEMORY,
-                )
-                cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
-                data.cpu_backup_tensor = cpu_backup_tensor
+                if host_backup_mode is None:
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=PIN_MEMORY,
+                    )
+                    cpu_ptr = cpu_backup_tensor.data_ptr()
+                    libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                    data.cpu_backup_tensor = cpu_backup_tensor
+                else:
+                    hb = data.host_backup
+                    if hb is None:
+                        hb = data.host_backup = _HostBackup(size_in_bytes)
+                    # "keep": weights do not change while serving, so the copy
+                    # made at an earlier sleep is still exact.
+                    if not (
+                        host_backup_mode == "keep" and data.tag == "weights" and hb.valid
+                    ):
+                        libcudart.cudaMemcpy(hb.ptr, ptr, size_in_bytes)
+                        hb.valid = True
+                    else:
+                        reused_bytes += size_in_bytes
+                    data.cpu_backup_tensor = hb.tensor
             try:
                 unmap_and_release(handle)
             finally:
@@ -287,6 +357,13 @@ class CuMemAllocator:
             backup_bytes / 1024**3,
             (total_bytes - backup_bytes) / 1024**3,
         )
+        if host_backup_mode is not None:
+            logger.info(
+                "CuMemAllocator: host backup mode %r; %.2f GiB of weight backups "
+                "reused without copying.",
+                host_backup_mode,
+                reused_bytes / 1024**3,
+            )
 
         if has_policy_conflict:
             logger.warning(
@@ -358,10 +435,49 @@ class CuMemAllocator:
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+                    if data.host_backup is not None:
+                        hb = data.host_backup
+                        if _host_backup_mode() == "keep" and data.tag == "weights":
+                            pass  # still exact: weights are not written while awake
+                        elif _host_backup_mode() == "keep":
+                            hb.valid = False  # buffer kept, contents stale once awake
+                        else:
+                            hb.release()  # type: ignore[attr-defined]
+                            data.host_backup = None
                 elif current_platform.is_rocm():
                     # amdgpu <6.14 may return stale VRAM (#44972); drop with its support
                     libcudart.cudaMemset(ptr, 0, handle[1])
                     torch.accelerator.synchronize()
+
+    def prepare_backup(self, tags: tuple[str, ...] = ("weights", "kv_cache")) -> int:
+        """Experiment (glm53-exp, VLLM_EXP_SLEEP_HOST_BACKUP set): allocate and
+        page-lock the exact-size host buffers for the given tags in a background
+        thread, so that the first sleep only has to copy. Host work only; a
+        later sleep() waits for it. Returns the number of bytes being prepared."""
+        import threading
+
+        if _host_backup_mode() is None:
+            return 0
+        items = [
+            data
+            for data in self.pointer_to_data.values()
+            if data.tag in tags and data.host_backup is None and not data.is_asleep
+        ]
+
+        device = torch.cuda.current_device()
+
+        def work() -> None:
+            # A new thread's current device is 0; registering from there would
+            # create a CUDA context on GPU 0 in every worker (~550 MiB each).
+            torch.cuda.set_device(device)
+            for data in items:
+                if data.host_backup is None:
+                    data.host_backup = _HostBackup(data.handle[1])
+
+        thread = threading.Thread(target=work, name="cumem-host-backup", daemon=True)
+        thread.start()
+        self._prepare_thread = thread
+        return sum(data.handle[1] for data in items)
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):

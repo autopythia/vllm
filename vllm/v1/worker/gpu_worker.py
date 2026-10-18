@@ -328,6 +328,14 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
+        # Experiment (glm53-exp): what is still resident besides the CUDA context.
+        logger.info(
+            "After sleep: torch allocated %s GiB, reserved %s GiB (outside the "
+            "sleep pools); device used %s GiB.",
+            format_gib(torch.cuda.memory_allocated()),
+            format_gib(torch.cuda.memory_reserved()),
+            format_gib(used_bytes),
+        )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.sleep_mode_backend.resume(tags)
@@ -357,6 +365,60 @@ class Worker(WorkerBase):
 
     def discard(self, tags: tuple[str, ...]) -> None:
         self.sleep_mode_backend.discard(tags)
+
+    def memory_report(self) -> str:
+        """Experiment (glm53-exp): where this worker's device memory is, e.g.
+        while asleep. Call through /collective_rpc. Returns JSON: device used,
+        the default allocator's segments (outside the sleep pools) by size, and
+        the largest live blocks there."""
+        import json
+
+        torch.accelerator.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        default_reserved = default_active = pool_reserved = 0
+        blocks: list[tuple[int, str]] = []
+        for seg in torch.cuda.memory_snapshot():
+            if seg.get("device") != torch.cuda.current_device():
+                continue
+            pool = tuple(seg.get("segment_pool_id") or (0, 0))
+            if pool != (0, 0):
+                pool_reserved += seg["total_size"]
+                continue
+            default_reserved += seg["total_size"]
+            for b in seg.get("blocks", []):
+                if b.get("state") == "active_allocated":
+                    default_active += b["size"]
+                    frames = [
+                        f"{f.get('filename', '?').split('site-packages/')[-1]}:{f.get('line')}"
+                        f" {f.get('name')}"
+                        for f in (b.get("frames") or [])
+                        if "/vllm/" in f.get("filename", "")
+                    ]
+                    where = " < ".join(frames[:3]) if frames else "?"
+                    blocks.append((b["size"], where))
+        blocks.sort(reverse=True)
+        return json.dumps(
+            {
+                "device_used_mib": round((total - free) / 2**20),
+                "default_reserved_mib": round(default_reserved / 2**20),
+                "default_active_mib": round(default_active / 2**20),
+                "pool_segments_listed_mib": round(pool_reserved / 2**20),
+                "largest_default_blocks_mib": [
+                    [round(sz / 2**20, 1), w] for sz, w in blocks[:12]
+                ],
+                "num_default_blocks": len(blocks),
+            }
+        )
+
+    def prepare_sleep_backup(self) -> int:
+        """Experiment (glm53-exp): start allocating the host buffers a sleep
+        will copy into (VLLM_EXP_SLEEP_HOST_BACKUP=exact|keep). Call through
+        /collective_rpc; returns the bytes being prepared on this worker."""
+        from vllm.device_allocator import get_mem_allocator_instance
+
+        allocator = get_mem_allocator_instance()
+        prepare = getattr(allocator, "prepare_backup", None)
+        return int(prepare()) if prepare is not None else 0
 
     def checkpoint_prepare(self) -> None:
         checkpoint_prepare_distributed_state()
@@ -585,6 +647,9 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if os.environ.get("EXP_MEM_HISTORY") == "1":
+            # Experiment (glm53-exp): stack traces for memory_report().
+            torch.cuda.memory._record_memory_history(max_entries=300000)
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
