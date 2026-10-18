@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -141,6 +142,14 @@ class SingleTypeKVCacheManager(ABC):
         # ``CacheConfig.enable_mamba_shared_prefix_checkpoint``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.shared_prefix_checkpoint = False
+        # Experiment (VLLM_EXP_KDA_DECODE_CHECKPOINT=1): also register prefix-cache
+        # entries at the hash boundaries a decode step ends on, so that the next
+        # turn of a conversation reuses the previous answer, not only the
+        # previous prompt. Mamba "align" groups snapshot their state there (the
+        # partial-tail copy-on-write); full attention adds an entry to its
+        # append-only block. Without speculative decoding only: a speculative
+        # step's state is at its last accepted token, not at the boundary.
+        self.decode_checkpoint = os.environ.get("VLLM_EXP_KDA_DECODE_CHECKPOINT", "0") == "1"
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -845,6 +854,26 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        if (
+            self.decode_checkpoint
+            and not self.use_eagle
+            and request.num_prompt_tokens < num_tokens
+            and num_tokens % hash_block_size == 0
+            and num_tokens % self.block_size != 0
+        ):
+            # Decode checkpoint (see SingleTypeKVCacheManager): the block is
+            # append-only, so the entry only joins the block's existing ones.
+            blocks = self.req_to_blocks[request.request_id]
+            block_idx = num_tokens // self.block_size
+            if block_idx < len(blocks):
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[block_idx],
+                    num_tokens=num_tokens,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    keep_existing_hashes=True,
+                )
 
     def _cache_partial_tail_block(
         self,
@@ -1449,6 +1478,11 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Decode checkpoints (decode_checkpoint): requests whose next CoW
+            # snapshots a decode-boundary state, and each request's latest
+            # snapshot, the only one kept (older ones are evicted from the cache).
+            self._decode_ckpt_reqs: set[str] = set()
+            self._decode_ckpt_blocks: dict[str, KVCacheBlock] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1896,6 +1930,14 @@ class MambaManager(SingleTypeKVCacheManager):
                             # The moved entry is only filled by this step's
                             # copy, so defer same-step hits on it.
                             self.cached_blocks_this_step.add(cow_block.block_hash)
+                        if request_id in self._decode_ckpt_reqs:
+                            # Keep one decode snapshot per request: a later turn
+                            # resumes at the latest boundary of the answer.
+                            self._decode_ckpt_reqs.discard(request_id)
+                            prev = self._decode_ckpt_blocks.get(request_id)
+                            if prev is not None and prev is not cow_block:
+                                self.block_pool._maybe_evict_cached_block(prev)
+                            self._decode_ckpt_blocks[request_id] = cow_block
                     else:
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
@@ -1939,6 +1981,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._decode_ckpt_reqs.discard(request_id)
+            self._decode_ckpt_blocks.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -2076,10 +2120,23 @@ class MambaManager(SingleTypeKVCacheManager):
         # to the prompt chunk being computed -- during decode the target is the
         # running state block, mutated in place, which equals what its key
         # promises only after that step's forward.
-        if num_tokens != latest_prompt_hash_boundary and not (
-            self.shared_prefix_checkpoint
-            and num_tokens == request.shared_prefix_boundary
-            and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
+        # Decode checkpoint: this step ends on a hash boundary past the prompt; one
+        # token per step, so after its forward the running state block holds the
+        # state at exactly ``num_tokens``, and the next step's CoW keeps it.
+        is_decode_checkpoint = (
+            self.decode_checkpoint
+            and self.num_speculative_blocks == 0
+            and request.num_prompt_tokens < num_tokens
+            and num_tokens % self.block_size != 0
+        )
+        if (
+            num_tokens != latest_prompt_hash_boundary
+            and not (
+                self.shared_prefix_checkpoint
+                and num_tokens == request.shared_prefix_boundary
+                and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
+            )
+            and not is_decode_checkpoint
         ):
             return None
 
@@ -2105,10 +2162,15 @@ class MambaManager(SingleTypeKVCacheManager):
             # in ``source_block`` but the next step's forward overwrites it. The
             # upcoming CoW copies it into a durable cow_block; record the req so
             # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = (
-                source_block,
-                num_tokens,
-            )
+            if is_decode_checkpoint:
+                # Not handed to the KV connector: its partial-tail offload
+                # covers prompt boundaries only (the CPU tier keeps prompts).
+                self._decode_ckpt_reqs.add(request.request_id)
+            else:
+                self._producer_partial_tail_reqs[request.request_id] = (
+                    source_block,
+                    num_tokens,
+                )
         return partial_hash
 
 

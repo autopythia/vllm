@@ -454,6 +454,7 @@ class BlockPool:
         kv_cache_group_id: int,
         block_size: int,
         replace_existing_hashes: bool = False,
+        keep_existing_hashes: bool = False,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -484,6 +485,10 @@ class BlockPool:
             replace_existing_hashes: Whether the block contents were replaced
                 and all existing cache entries must be removed before the new
                 entry is registered.
+            keep_existing_hashes: Add the entry next to the block's existing
+                ones even when they cover fewer tokens (by default a longer
+                partial entry replaces a shorter one). For append-only blocks,
+                whose earlier content stays valid.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -510,6 +515,7 @@ class BlockPool:
             already_cached = False
         elif (
             not already_cached
+            and not keep_existing_hashes
             and block.block_hash is not None
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
