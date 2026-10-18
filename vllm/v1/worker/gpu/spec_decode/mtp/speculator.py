@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch.nn as nn
 
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
@@ -18,6 +20,11 @@ class MTPSpeculator(TargetDependentARSpeculator):
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
+        if os.environ.get("VLLM_EXP_MTP_FP8_HEAD", "0") == "1" and hasattr(
+            draft_model.model, "build_fp8_head"
+        ):
+            # Experiment: draft logits from an FP8 copy of the shared LM head.
+            draft_model.model.build_fp8_head()
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config

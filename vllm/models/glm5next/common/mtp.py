@@ -176,6 +176,35 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             assert isinstance(self_attn, Glm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._fp8_heads: list | None = None
+
+    def build_fp8_head(self) -> None:
+        """Experiment (VLLM_EXP_MTP_FP8_HEAD=1): draft logits from a row-scaled FP8 copy of the shared LM head
+        (mtp_fp8_head.py), half the bytes of the BF16 head per draft. Call after the head is shared."""
+        from .mtp_fp8_head import Fp8Head
+
+        copies: dict[int, Fp8Head] = {}
+        self._fp8_heads = []
+        for layer in self._mtp_layers:
+            head = layer.shared_head.head
+            if id(head) not in copies:
+                copies[id(head)] = Fp8Head(head.weight)
+            self._fp8_heads.append(copies[id(head)])
+
+    def _fp8_logits(self, step_idx: int, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        from .mtp_fp8_head import MAX_ROWS
+
+        if self._fp8_heads is None or not 1 <= hidden_states.shape[0] <= MAX_ROWS:
+            return None
+        if self._mtp_layers[step_idx].shared_head.head.tp_size > 1:
+            return None
+        lp = self.logits_processor
+        logits = self._fp8_heads[step_idx](hidden_states)[..., : lp.org_vocab_size]
+        if lp.soft_cap is not None:
+            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+        if lp.scale != 1.0:
+            logits = logits * lp.scale
+        return logits
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -222,6 +251,9 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
+        logits = self._fp8_logits(current_step_idx, hidden_states)
+        if logits is not None:
+            return logits
         return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
 
     def get_top_tokens(
@@ -237,6 +269,9 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
+        logits = self._fp8_logits(current_step_idx, hidden_states)
+        if logits is not None:
+            return logits.max(dim=-1).indices
         return self.logits_processor.get_top_tokens(
             mtp_layer.shared_head.head, hidden_states
         )
