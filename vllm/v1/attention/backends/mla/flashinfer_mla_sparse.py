@@ -412,12 +412,30 @@ def _get_workspace_buffer(
     if _fi_sparse_workspace is None or _fi_sparse_workspace.numel() < required:
         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
-        _fi_sparse_workspace = torch.zeros(
-            required,
-            dtype=torch.int8,
-            device=device,
-        )
+        with _sleep_offloadable_pool():
+            _fi_sparse_workspace = torch.zeros(
+                required,
+                dtype=torch.int8,
+                device=device,
+            )
     return _fi_sparse_workspace
+
+
+def _sleep_offloadable_pool():
+    """With the sleep-mode allocator in use, allocate in its "runtime" pool: a
+    sleep backs it up and restores it at the same address, so CUDA graphs keep
+    their pointers and the buffer no longer stays resident while asleep (394 MiB
+    per GPU at 256K). Otherwise, and during graph capture, a plain allocation."""
+    from contextlib import nullcontext
+
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except Exception:
+        return nullcontext()
+    allocator = CuMemAllocator.instance
+    if allocator is None or torch.cuda.is_current_stream_capturing():
+        return nullcontext()
+    return allocator.use_memory_pool(tag="runtime")
 
 
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
