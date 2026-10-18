@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -754,13 +755,44 @@ class OnlineRenderer:
         )
 
     def signature_fingerprint(self, request: Any) -> bytes:
-        """Model, vocabulary and chat template that a signature is valid for."""
+        """Model, vocabulary and chat template that a signature is valid for.
+
+        The template is the one this request is rendered with: the request's,
+        the server's ``--chat-template``, or else the checkpoint's own.
+        """
         from vllm.entrypoints.openai.chat_completion import signature as _sig
 
         tokenizer = self.renderer.tokenizer
         vocab_size = len(tokenizer) if tokenizer is not None else 0
         template = getattr(request, "chat_template", None) or self.chat_template
+        template = self._signature_template(
+            template, bool(getattr(request, "tools", None))
+        )
         return _sig.fingerprint(self.model_config.model, vocab_size, template)
+
+    def _signature_template(self, template: str | None, has_tools: bool) -> str | None:
+        """The template text the renderer resolves for these settings (cached)."""
+        cache: dict[tuple[str | None, bool], str | None]
+        cache = self.__dict__.setdefault("_signature_templates", {})
+        key = (template, has_tools)
+        if key not in cache:
+            resolved = template
+            try:
+                from vllm.renderers.hf import resolve_chat_template
+
+                # Only whether there are tools affects the resolution.
+                resolved = resolve_chat_template(
+                    self.renderer.get_tokenizer(),
+                    chat_template=template,
+                    tools=[{}] if has_tools else None,
+                    model_config=self.model_config,
+                ) or template
+            except Exception:
+                logger.debug("signature: chat template not resolved", exc_info=True)
+            if len(cache) >= 16:
+                cache.clear()
+            cache[key] = resolved
+        return cache[key]
 
     async def _signature_replay_ids(
         self,
@@ -781,15 +813,27 @@ class OnlineRenderer:
         i = _sig.last_signed_assistant(messages)
         if i is None:
             return None
+        signature, tools = messages[i]["signature"], _sig.tools_of(request)
+        renderer = self.renderer
+
+        def check() -> tuple[bytes, bytes, list[int]]:
+            # Off the event loop: at ~870K tokens decoding and the digest take
+            # ~0.05 s, during which other requests' streams would stall.
+            fp, digest, transcript = _sig.decode(signature)
+            renderer.validate_token_ids(
+                transcript, parameter=f"messages[{i}].signature"
+            )
+            return fp, digest == _sig.inputs_digest(messages[:i], tools), transcript
+
         try:
-            fp, digest, transcript = _sig.decode(messages[i]["signature"])
+            fp, digest_ok, transcript = await asyncio.to_thread(check)
         except _sig.SignatureError as e:
             raise _signature_error(f"Invalid signature: {e}.", i) from None
         if fp != self.signature_fingerprint(request):
             raise _signature_error(
                 "The signature was made for another model, tokenizer or chat template.", i
             )
-        if digest != _sig.inputs_digest(messages[:i], _sig.tools_of(request)):
+        if not digest_ok:
             raise _signature_error(
                 "The non-assistant messages or tools before the signed message differ "
                 "from those the signature was made for.",
@@ -797,15 +841,15 @@ class OnlineRenderer:
             )
         if has_non_text_content(messages):
             raise _signature_error("Signatures support text-only conversations.", i)
-        renderer = self.renderer
-        renderer.validate_token_ids(transcript, parameter=f"messages[{i}].signature")
         # The signed message itself is replaced by its transcript; render it empty
         # (keeping tool_calls, which later tool messages may refer to) and take the
-        # template's output after it.
+        # template's output after it. The earlier messages only decide where that
+        # output starts, so they are rendered as stand-ins first (tokenizing a long
+        # history twice took seconds); the full history only if the stand-ins'
+        # prefix check fails.
         signed = {"role": "assistant", "content": ""}
         if messages[i].get("tool_calls"):
             signed["tool_calls"] = messages[i]["tool_calls"]
-        head = [*messages[:i], signed]
         head_params = replace(
             chat_params,
             chat_template_kwargs={
@@ -814,15 +858,20 @@ class OnlineRenderer:
                 "continue_final_message": False,
             },
         )
-        _, (head_input,) = await renderer.render_chat_async(
-            [head], head_params, tok_params
-        )
-        _, (full_input,) = await renderer.render_chat_async(
-            [[*head, *messages[i + 1 :]]], chat_params, tok_params
-        )
-        head_ids = head_input["prompt_token_ids"]
-        full_ids = full_input["prompt_token_ids"]
-        if full_ids[: len(head_ids)] != head_ids:
+        for history in (_sig.stand_in_history(messages[:i]), messages[:i]):
+            head = [*history, signed]
+            _, (head_input,) = await renderer.render_chat_async(
+                [head], head_params, tok_params
+            )
+            _, (full_input,) = await renderer.render_chat_async(
+                [[*head, *messages[i + 1 :]]], chat_params, tok_params
+            )
+            head_ids = head_input["prompt_token_ids"]
+            full_ids = full_input["prompt_token_ids"]
+            if full_ids[: len(head_ids)] == head_ids:
+                break
+            logger.debug("Signature replay: the stand-in history did not cut cleanly.")
+        else:
             raise _signature_error(
                 "Cannot replay: the chat template renders the messages up to the "
                 "signed one differently once later messages follow.",

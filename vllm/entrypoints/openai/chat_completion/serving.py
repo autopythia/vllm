@@ -447,7 +447,7 @@ class OpenAIServingChat(GenerateBaseServing):
         """
         return ChatMessage(*args, **kwargs)
 
-    def _signature_for(
+    async def _signature_for(
         self,
         request: ChatCompletionRequest,
         prompt_token_ids: list[int],
@@ -457,13 +457,21 @@ class OpenAIServingChat(GenerateBaseServing):
     ) -> str:
         from vllm.entrypoints.openai.chat_completion import signature as _sig
 
-        return _sig.encode(
-            _sig.transcript_of(
-                prompt_token_ids, output_token_ids, finish_reason, stop_reason
-            ),
-            self.online_renderer.signature_fingerprint(request),
-            _sig.inputs_digest(request.messages, _sig.tools_of(request)),
-        )
+        fp = self.online_renderer.signature_fingerprint(request)
+        tools = _sig.tools_of(request)
+
+        def make() -> str:
+            return _sig.encode(
+                _sig.transcript_of(
+                    prompt_token_ids, output_token_ids, finish_reason, stop_reason
+                ),
+                fp,
+                _sig.inputs_digest(request.messages, tools),
+            )
+
+        # Off the event loop: at ~870K tokens this takes ~0.1 s, during which
+        # every other stream of this server would stall.
+        return await asyncio.to_thread(make)
 
     def _finalize_response_message(
         self,
@@ -806,7 +814,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             request.return_signature
                             and signature_prompt_ids is not None
                         ):
-                            delta_message.signature = self._signature_for(
+                            delta_message.signature = await self._signature_for(
                                 request,
                                 signature_prompt_ids,
                                 signature_output_ids[i],
@@ -1128,7 +1136,7 @@ class OpenAIServingChat(GenerateBaseServing):
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
             if request.return_signature and final_res.prompt_token_ids is not None:
-                message.signature = self._signature_for(
+                message.signature = await self._signature_for(
                     request,
                     final_res.prompt_token_ids,
                     output.token_ids,
