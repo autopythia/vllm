@@ -176,7 +176,7 @@ class CPUWorker(Worker):
         else:
             self.model_runner = CPUModelRunner(self.vllm_config, torch.device("cpu"))
 
-    def sleep(self, level: int = 1) -> None:
+    def sleep(self, level: int = 1, offload_kv_cache: bool = False) -> None:
         logger.warning("sleep mode is not supported on CPU, ignore it.")
         pass
 

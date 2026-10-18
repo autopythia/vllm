@@ -50,12 +50,14 @@ class SleepModeBackend(ABC):
         self._state: SleepModeState = "RUNNING"
 
     @abstractmethod
-    def suspend(self, level: int = 1) -> None:
+    def suspend(self, level: int = 1, offload_kv_cache: bool = False) -> None:
         """Free GPU state.
 
         ``level`` follows existing sleep-mode semantics: level 1 offloads
         weights to host RAM (restorable in-process); level 2 discards weights
-        (reloaded from the model source on resume).
+        (reloaded from the model source on resume). ``offload_kv_cache`` also
+        backs the KV cache up to host RAM instead of discarding it, so that its
+        contents (and the prefix cache that indexes them) survive the sleep.
         """
         raise NotImplementedError
 
@@ -124,16 +126,18 @@ class CuMemBackend(SleepModeBackend):
     are allocated outside the allocator pool).
     """
 
-    def suspend(self, level: int = 1) -> None:
+    def suspend(self, level: int = 1, offload_kv_cache: bool = False) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
 
         self._state = "SUSPENDED"
         allocator = get_mem_allocator_instance()
         # Runtime state and graph pools are kept at every level; weights only
-        # at level 1.
+        # at level 1; the KV cache only when asked to.
         offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
         if level == 1:
             offload_tags = ("weights", *offload_tags)
+        if offload_kv_cache:
+            offload_tags = (*offload_tags, "kv_cache")
         allocator.sleep(offload_tags=offload_tags)
 
     def resume(self, tags: list[str] | None = None) -> None:

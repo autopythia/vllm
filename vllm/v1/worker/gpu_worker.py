@@ -291,7 +291,7 @@ class Worker(WorkerBase):
             parameters[name].copy_(value)
         self._sleep_saved_parameters.clear()
 
-    def sleep(self, level: int = 1) -> None:
+    def sleep(self, level: int = 1, offload_kv_cache: bool = False) -> None:
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
@@ -308,7 +308,7 @@ class Worker(WorkerBase):
                     name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
                 }
 
-        self.sleep_mode_backend.suspend(level)
+        self.sleep_mode_backend.suspend(level, offload_kv_cache=offload_kv_cache)
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
             suspend_device_comms()
 

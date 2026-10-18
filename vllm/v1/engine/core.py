@@ -956,7 +956,9 @@ class EngineCore:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
-    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
+    def sleep(
+        self, level: int = 1, mode: PauseMode = "abort", offload_kv_cache: bool = False
+    ) -> None | Future:
         """Put the engine to sleep at the specified level.
 
         Args:
@@ -967,10 +969,15 @@ class EngineCore:
                 - Level 2: Discard all GPU memory.
             mode: Pause mode - how to deal with any existing requests, see
                 documentation of pause_scheduler method.
+            offload_kv_cache: Level 1+: back the KV cache up to CPU memory
+                instead of discarding it, and keep the prefix cache. After
+                wake-up, cached prefixes hit again and requests kept with
+                mode "keep" continue from their KV cache, without recompute.
 
         """
-        # Pause scheduler before sleeping.
-        clear_prefix_cache = level >= 1
+        # Pause scheduler before sleeping. A preserved KV cache keeps the prefix
+        # cache (and kept requests' blocks) valid.
+        clear_prefix_cache = level >= 1 and not offload_kv_cache
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
         if level < 1:
             return pause_future
@@ -978,7 +985,7 @@ class EngineCore:
         # Level 1+: Delegate to executor for GPU memory management
         model_executor = self.model_executor
         if pause_future is None:
-            model_executor.sleep(level)
+            model_executor.sleep(level, offload_kv_cache=offload_kv_cache)
             return None
 
         future = Future[Any]()
@@ -986,7 +993,9 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                future.set_result(
+                    model_executor.sleep(level, offload_kv_cache=offload_kv_cache)
+                )
             except Exception as e:
                 future.set_exception(e)
 
