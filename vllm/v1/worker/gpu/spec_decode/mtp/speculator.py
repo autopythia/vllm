@@ -35,7 +35,23 @@ class MTPSpeculator(TargetDependentARSpeculator):
         )
         return draft_model
 
+    def _cpu_moe_layers(self) -> list[nn.Module]:
+        # MTP layers whose routed experts run on the CPU (VLLM_EXP_MTP_CPU_MOE=1) need
+        # to know which rows of a draft forward are sampled.
+        layers = getattr(self, "_cpu_moe_cache", None)
+        if layers is None:
+            layers = [m for m in self.model.modules() if hasattr(m, "set_sample_rows")]
+            self._cpu_moe_cache = layers
+        return layers
+
     def on_prefill_begin(self, num_reqs: int) -> None:
+        # CPU MoE, draft step 0: only the requests' last token indices are sampled;
+        # padded request slots have seq_len 0. Set in this hook because it fires at
+        # graph capture (num_reqs = max_num_reqs) and before every replay alike.
+        for layer in self._cpu_moe_layers():
+            layer.set_sample_rows(
+                self.last_token_indices, num_reqs, self.input_buffers.seq_lens
+            )
         # Step 0 computes its own top-k. Unconditional, so a step that died
         # midway cannot leave reuse mode on.
         if self.share_mtp_topk_indices:
@@ -49,6 +65,9 @@ class MTPSpeculator(TargetDependentARSpeculator):
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
+        # CPU MoE, draft steps 1+ (fused or not): one row per request.
+        for layer in self._cpu_moe_layers():
+            layer.set_sample_rows(None, num_reqs, self.input_buffers.seq_lens)
         # Switch to reuse mode so draft steps 1+ skip the indexer op and read
         # the indices that step 0 wrote into the shared buffer.
         if self.share_mtp_topk_indices:

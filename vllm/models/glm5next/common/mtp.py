@@ -99,6 +99,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        cpu_moe = self.mtp_block.mlp
+        if getattr(cpu_moe, "is_cpu_moe", False):
+            # Wake the CPU workers now, so they spin by the time the MoE starts.
+            cpu_moe.prewake()
         # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
         eh_input = fused_eh_norm(
             positions,
@@ -297,6 +301,21 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         # vocab-parallel argmax, no full-vocab logits.
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
+    def _load_cpu_moe_expert(
+        self, spec_layer: int, name: str, loaded_weight: torch.Tensor
+    ) -> bool:
+        """Routed-expert weights of an MTP layer whose experts run on the CPU go to its
+        engine (mtp_cpu_moe.py); returns whether ``name`` was one."""
+        layer = self.model.layers[str(spec_layer)]
+        moe = layer.mtp_block.mlp
+        if not getattr(moe, "is_cpu_moe", False) or ".mlp.experts." not in name:
+            return False
+        stem = name.rsplit(".mlp.experts.", 1)[1]  # "<e>.<gate|up|down>_proj.weight"
+        expert, proj = stem.split(".")[:2]
+        which = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[proj]
+        moe.load_expert_weight(int(expert), which, loaded_weight)
+        return True
+
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         spec_layer_weight_names = [
             "embed_tokens",
@@ -381,6 +400,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(name)
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+            if self._load_cpu_moe_expert(spec_layer, name, loaded_weight):
+                loaded_params.add(name)
+                continue
             if self.is_fused_shared_expert_enabled:
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
@@ -468,6 +490,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        for layer in self.model.layers.values():
+            if getattr(layer.mtp_block.mlp, "is_cpu_moe", False):
+                layer.mtp_block.mlp.finish_loading()
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:

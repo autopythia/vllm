@@ -92,6 +92,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from . import mtp_cpu_moe
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -410,7 +411,18 @@ class Glm5NextDecoderLayer(nn.Module):
             if layer_idx < len(mlp_layer_types)
             else (mlp_layer_types[-1] if mlp_layer_types else "sparse")
         )
-        if self.is_moe and self.num_experts is not None and mlp_type == "sparse":
+        if (
+            self.is_moe
+            and self.num_experts is not None
+            and mlp_type == "sparse"
+            and is_mtp_layer
+            and mtp_cpu_moe.enabled()
+        ):
+            # Experiment: the MTP layer's routed experts on the CPU (mtp_cpu_moe.py).
+            self.mlp = mtp_cpu_moe.MtpCpuMoE(
+                config, vllm_config, quant_config, prefix=f"{prefix}.mlp"
+            )
+        elif self.is_moe and self.num_experts is not None and mlp_type == "sparse":
             self.mlp = Glm5NextMoE(
                 config=config,
                 parallel_config=parallel_config,
