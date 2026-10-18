@@ -345,10 +345,14 @@ class DeltaMessage(OpenAIBaseModel):
     content: str | None = None
     reasoning: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+    # Chat completions with ``return_signature``: set on a choice's final chunk.
+    signature: str | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        if data.get("signature") is None:
+            data.pop("signature", None)
         return data

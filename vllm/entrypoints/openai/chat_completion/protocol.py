@@ -75,12 +75,17 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    signature: str | None = None
+    """Token-exact transcript up to the end of this message (``return_signature``).
+    Send the message back with it to replay the exact tokens."""
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        if data.get("signature") is None:
+            data.pop("signature", None)
         return data
 
 
@@ -432,6 +437,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=0,
         ge=0,
         description="Skip the first N prompt tokens from returned routed-expert data.",
+    )
+    return_signature: bool = Field(
+        default=False,
+        description=(
+            "If true, each returned assistant message carries `signature`: the "
+            "exact token transcript (prompt and sampled tokens) up to the end of "
+            "that message, compactly encoded. A later request that includes the "
+            "message with its signature replays those tokens verbatim and renders "
+            "only the messages after it with the chat template."
+        ),
     )
     return_token_offsets: bool | None = Field(
         default=False,

@@ -447,6 +447,24 @@ class OpenAIServingChat(GenerateBaseServing):
         """
         return ChatMessage(*args, **kwargs)
 
+    def _signature_for(
+        self,
+        request: ChatCompletionRequest,
+        prompt_token_ids: list[int],
+        output_token_ids: Any,
+        finish_reason: str | None,
+        stop_reason: int | str | None,
+    ) -> str:
+        from vllm.entrypoints.openai.chat_completion import signature as _sig
+
+        return _sig.encode(
+            _sig.transcript_of(
+                prompt_token_ids, output_token_ids, finish_reason, stop_reason
+            ),
+            self.online_renderer.signature_fingerprint(request),
+            _sig.inputs_digest(request.messages, _sig.tools_of(request)),
+        )
+
     def _finalize_response_message(
         self,
         message: ChatMessage,
@@ -484,6 +502,9 @@ class OpenAIServingChat(GenerateBaseServing):
         previous_num_tokens = [0] * num_choices
         # TODO: Remove once all reasoning parsers use the Parser Engine.
         generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
+        # return_signature: the prompt ids and each choice's sampled ids.
+        signature_prompt_ids: list[int] | None = None
+        signature_output_ids: list[list[int]] = [[] for _ in range(num_choices)]
         previous_reasoning_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
@@ -527,6 +548,7 @@ class OpenAIServingChat(GenerateBaseServing):
             async for res in result_generator:
                 last_res = res
                 if res.prompt_token_ids is not None:
+                    signature_prompt_ids = res.prompt_token_ids
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
@@ -637,6 +659,8 @@ class OpenAIServingChat(GenerateBaseServing):
                         continue
 
                     self._raise_if_error(output.finish_reason, request_id)
+                    if request.return_signature:
+                        signature_output_ids[i].extend(output.token_ids)
 
                     if request.logprobs:
                         assert output.logprobs is not None, "Did not output logprobs"
@@ -777,6 +801,17 @@ class OpenAIServingChat(GenerateBaseServing):
                         else:
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
+                            )
+                        if (
+                            request.return_signature
+                            and signature_prompt_ids is not None
+                        ):
+                            delta_message.signature = self._signature_for(
+                                request,
+                                signature_prompt_ids,
+                                signature_output_ids[i],
+                                output.finish_reason,
+                                output.stop_reason,
                             )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -1092,6 +1127,14 @@ class OpenAIServingChat(GenerateBaseServing):
             # citation-aware handlers use this to surface grounding
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
+            if request.return_signature and final_res.prompt_token_ids is not None:
+                message.signature = self._signature_for(
+                    request,
+                    final_res.prompt_token_ids,
+                    output.token_ids,
+                    output.finish_reason,
+                    output.stop_reason,
+                )
 
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,

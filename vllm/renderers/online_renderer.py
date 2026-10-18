@@ -102,6 +102,10 @@ def _extract_allowed_tools_from_mcp_requests(
     return allowed_tools_map
 
 
+def _signature_error(message: str, index: int) -> VLLMValidationError:
+    return VLLMValidationError(message, parameter=f"messages[{index}].signature")
+
+
 def _reused_prompt_token_ids(
     request: Any, renderer: BaseRenderer, messages: list[Any] | None = None
 ) -> list[int] | None:
@@ -749,6 +753,88 @@ class OnlineRenderer:
             skip_mm_cache=skip_mm_cache,
         )
 
+    def signature_fingerprint(self, request: Any) -> bytes:
+        """Model, vocabulary and chat template that a signature is valid for."""
+        from vllm.entrypoints.openai.chat_completion import signature as _sig
+
+        tokenizer = self.renderer.tokenizer
+        vocab_size = len(tokenizer) if tokenizer is not None else 0
+        template = getattr(request, "chat_template", None) or self.chat_template
+        return _sig.fingerprint(self.model_config.model, vocab_size, template)
+
+    async def _signature_replay_ids(
+        self,
+        request: Any,
+        messages: list[Any],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+    ) -> list[int] | None:
+        """Prompt ids for a request whose history holds a signed assistant message:
+        that message's transcript, then the template's rendering of the messages
+        after it. None if no assistant message carries a signature."""
+        from dataclasses import replace
+
+        from vllm.entrypoints.openai.chat_completion import signature as _sig
+
+        if not isinstance(request, ChatCompletionRequest):
+            return None
+        i = _sig.last_signed_assistant(messages)
+        if i is None:
+            return None
+        try:
+            fp, digest, transcript = _sig.decode(messages[i]["signature"])
+        except _sig.SignatureError as e:
+            raise _signature_error(f"Invalid signature: {e}.", i) from None
+        if fp != self.signature_fingerprint(request):
+            raise _signature_error(
+                "The signature was made for another model, tokenizer or chat template.", i
+            )
+        if digest != _sig.inputs_digest(messages[:i], _sig.tools_of(request)):
+            raise _signature_error(
+                "The non-assistant messages or tools before the signed message differ "
+                "from those the signature was made for.",
+                i,
+            )
+        if has_non_text_content(messages):
+            raise _signature_error("Signatures support text-only conversations.", i)
+        renderer = self.renderer
+        renderer.validate_token_ids(transcript, parameter=f"messages[{i}].signature")
+        # The signed message itself is replaced by its transcript; render it empty
+        # (keeping tool_calls, which later tool messages may refer to) and take the
+        # template's output after it.
+        signed = {"role": "assistant", "content": ""}
+        if messages[i].get("tool_calls"):
+            signed["tool_calls"] = messages[i]["tool_calls"]
+        head = [*messages[:i], signed]
+        head_params = replace(
+            chat_params,
+            chat_template_kwargs={
+                **chat_params.chat_template_kwargs,
+                "add_generation_prompt": False,
+                "continue_final_message": False,
+            },
+        )
+        _, (head_input,) = await renderer.render_chat_async(
+            [head], head_params, tok_params
+        )
+        _, (full_input,) = await renderer.render_chat_async(
+            [[*head, *messages[i + 1 :]]], chat_params, tok_params
+        )
+        head_ids = head_input["prompt_token_ids"]
+        full_ids = full_input["prompt_token_ids"]
+        if full_ids[: len(head_ids)] != head_ids:
+            raise _signature_error(
+                "Cannot replay: the chat template renders the messages up to the "
+                "signed one differently once later messages follow.",
+                i,
+            )
+        logger.debug(
+            "Replaying a %d-token signed transcript plus %d rendered tokens.",
+            len(transcript),
+            len(full_ids) - len(head_ids),
+        )
+        return [*transcript, *full_ids[len(head_ids) :]]
+
     async def preprocess_chat(
         self,
         request: Any,
@@ -790,12 +876,14 @@ class OnlineRenderer:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        reuse_ids = _reused_prompt_token_ids(request, renderer, messages)
+        reuse_ids = await self._signature_replay_ids(
+            request, messages, chat_params, tok_params
+        ) or _reused_prompt_token_ids(request, renderer, messages)
         if reuse_ids:
-            # Decode-side token reuse: feed the forwarded ids straight to the
-            # engine, skipping templating and tokenization. ``messages`` are not
-            # tokenized, so conversation is empty. The adjust_request tail below
-            # still runs.
+            # Decode-side token reuse (or a signed transcript): feed the ids
+            # straight to the engine, skipping templating and tokenization.
+            # ``messages`` are not tokenized, so conversation is empty. The
+            # adjust_request tail below still runs.
             conversation: list[ConversationMessage] = []
             engine_input = tokens_input(
                 reuse_ids, cache_salt=getattr(request, "cache_salt", None)
