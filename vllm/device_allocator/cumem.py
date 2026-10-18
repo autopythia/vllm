@@ -11,6 +11,7 @@
 import atexit
 import gc
 import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -92,6 +93,66 @@ def _host_backup_mode() -> str | None:
     return mode if mode in ("exact", "keep") else None
 
 
+# A "keep" weight backup is reused for the parts of an allocation that have not
+# changed since it was made: one position-weighted int64 sum per _SUM_CHUNK
+# bytes, computed on the GPU at each sleep.
+_SUM_CHUNK = 1 << 20
+_SUM_SLAB = 32  # chunks per kernel launch (32 MiB of int64 products at a time)
+_SUM_WEIGHTS: dict[int, torch.Tensor] = {}
+
+
+class _DeviceBytes:
+    """A device address range as an int64 tensor, for ``torch.as_tensor``."""
+
+    def __init__(self, ptr: int, nbytes: int) -> None:
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes // 8,),
+            "typestr": "<i8",
+            "data": (ptr, False),
+            "version": 2,
+            "strides": None,
+        }
+
+
+def _chunk_sums(ptr: int, size: int) -> torch.Tensor:
+    """Position-weighted sums (int64, wrapping) of each _SUM_CHUNK bytes of a
+    device allocation, as a CPU tensor. Weighted so that values moved within a
+    chunk change its sum too."""
+    dev = torch.cuda.current_device()
+    words = _SUM_CHUNK // 8
+    w = _SUM_WEIGHTS.get(dev)
+    if w is None:
+        # Distinct odd weights: a change of any single word changes the sum.
+        w = torch.arange(1, words + 1, dtype=torch.int64, device=dev)
+        w = _SUM_WEIGHTS[dev] = w * 2654435761 | 1
+    n = size // 8
+    v = torch.as_tensor(_DeviceBytes(ptr, n * 8), device=torch.device("cuda", dev))
+    full = n // words
+    out = torch.empty(full + (1 if n % words else 0), dtype=torch.int64, device=dev)
+    for i in range(0, full, _SUM_SLAB):
+        j = min(i + _SUM_SLAB, full)
+        out[i:j] = (v[i * words : j * words].view(j - i, words) * w).sum(dim=1)
+    if n % words:
+        tail = v[full * words :]
+        out[full] = (tail * w[: tail.numel()]).sum()
+    return out.cpu()
+
+
+def _runs(indices: list[int]) -> Iterator[tuple[int, int]]:
+    """Consecutive runs of sorted indices, as (first, last)."""
+    start = prev = None
+    for i in indices:
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            yield start, prev
+            start = prev = i
+    if start is not None:
+        yield start, prev
+
+
 class _HostBackup:
     """Exact-size, page-locked host copy of one allocation while asleep.
 
@@ -102,7 +163,7 @@ class _HostBackup:
     measured), falling back to unpinned memory if registration fails.
     """
 
-    __slots__ = ("tensor", "ptr", "registered", "valid")
+    __slots__ = ("tensor", "ptr", "registered", "valid", "sums")
 
     def __init__(self, size: int) -> None:
         self.tensor: torch.Tensor | None = torch.empty(
@@ -111,6 +172,7 @@ class _HostBackup:
         self.ptr = self.tensor.data_ptr()
         self.registered = False
         self.valid = False
+        self.sums: torch.Tensor | None = None  # "keep" weights: _chunk_sums of the copy
         if PIN_MEMORY and size > 0:
             # cudaHostRegisterPortable: pinned for every context, so a helper
             # thread with another current device can register it.
@@ -301,6 +363,8 @@ class CuMemAllocator:
         total_bytes = 0
         backup_bytes = 0
         reused_bytes = 0
+        recopied_bytes = 0
+        sum_seconds = 0.0
         has_policy_conflict = False
         host_backup_mode = _host_backup_mode()
         prepare_thread = getattr(self, "_prepare_thread", None)
@@ -334,15 +398,34 @@ class CuMemAllocator:
                     hb = data.host_backup
                     if hb is None:
                         hb = data.host_backup = _HostBackup(size_in_bytes)
-                    # "keep": weights do not change while serving, so the copy
-                    # made at an earlier sleep is still exact.
-                    if not (
-                        host_backup_mode == "keep" and data.tag == "weights" and hb.valid
-                    ):
-                        libcudart.cudaMemcpy(hb.ptr, ptr, size_in_bytes)
+                    if host_backup_mode == "keep" and data.tag == "weights":
+                        # "keep": the weights do not change while serving, so the
+                        # copy made at an earlier sleep is reused. But the
+                        # "weights" pool holds everything made during load_model,
+                        # including state that serving writes (e.g. the V2
+                        # runner's per-request mamba state indices, sampler
+                        # penalty state, top-k and pipeline buffers): the parts
+                        # that changed since the last copy are copied again.
+                        t_sum = time.perf_counter()
+                        sums = _chunk_sums(ptr, size_in_bytes)
+                        sum_seconds += time.perf_counter() - t_sum
+                        old = hb.sums if hb.valid else None
+                        if old is not None and old.shape == sums.shape:
+                            changed = (sums != old).nonzero().flatten().tolist()
+                            for lo, hi in _runs(changed):
+                                off = lo * _SUM_CHUNK
+                                n = min((hi + 1) * _SUM_CHUNK, size_in_bytes) - off
+                                libcudart.cudaMemcpy(hb.ptr + off, ptr + off, n)
+                                recopied_bytes += n
+                                reused_bytes -= n
+                            reused_bytes += size_in_bytes
+                        else:
+                            libcudart.cudaMemcpy(hb.ptr, ptr, size_in_bytes)
+                        hb.sums = sums
                         hb.valid = True
                     else:
-                        reused_bytes += size_in_bytes
+                        libcudart.cudaMemcpy(hb.ptr, ptr, size_in_bytes)
+                        hb.valid = True
                     data.cpu_backup_tensor = hb.tensor
             try:
                 unmap_and_release(handle)
@@ -360,9 +443,12 @@ class CuMemAllocator:
         if host_backup_mode is not None:
             logger.info(
                 "CuMemAllocator: host backup mode %r; %.2f GiB of weight backups "
-                "reused without copying.",
+                "reused without copying, %.1f MiB copied again (changed since the "
+                "last sleep; checksums %.2f s).",
                 host_backup_mode,
                 reused_bytes / 1024**3,
+                recopied_bytes / 1024**2,
+                sum_seconds,
             )
 
         if has_policy_conflict:
