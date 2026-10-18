@@ -7,7 +7,9 @@ starting vLLM (by path: it does not import vllm). Prints shell assignments:
 
   MTP_MOE_CPUS=...      VLLM_EXP_MTP_CPU_MOE_CPUS: --workers physical cores (default 48; one hardware thread each),
                         spread evenly over the NUMA nodes, the first cores of each; at most 80% of the container's CPU
-                        quota, and leaving --reserve cores (default 8) and the watcher's to the server
+                        quota, and leaving --reserve cores (default 4, VLLM_EXP_MTP_CPU_MOE_RESERVE) and the
+                        watcher's to the server, whose own threads keep ~3 CPUs busy (two pipeline workers and the
+                        engine core, each polling; the API server and long-prompt tokenization add little)
   MTP_WATCHER_CPU=...   VLLM_EXP_MTP_CPU_MOE_WATCHER_CPU: a free physical core on the NUMA node of the drafter's GPU
                         (the last pipeline stage's, by default the last visible GPU)
   MTP_SERVER_CPUS=...   for taskset: every allowed CPU except those cores and their SMT siblings, so no server thread
@@ -18,7 +20,8 @@ The CPU MoE streams the selected experts' weights from memory; its time per call
 channels and of workers reading them. A fixed count per node (--per-node, the earlier default of 12) gave a 1- or
 2-node machine 12 or 24 workers: per call 2.5-3x or 1.3-1.8x slower than 48 on the same socket (exp/cpu_moe_bench.c
 on CPU subsets of a 2-socket Xeon 6767P).
-usage: mtp_cpu_plan.py [--workers 48] [--per-node N] [--reserve 8] [--gpu-bus-id 0000:41:00.0]
+With fewer than --min-workers (8, or --workers if lower) workers it exits: MTP=2 would gain little there.
+usage: mtp_cpu_plan.py [--workers 48] [--per-node N] [--reserve 4] [--min-workers 8] [--gpu-bus-id 0000:41:00.0]
 """
 import argparse, glob, os, re, subprocess
 
@@ -92,7 +95,7 @@ def topology():
     return allowed, (nodes or {0: allowed})
 
 
-def plan(allowed, nodes, sib, q, gn, workers=48, per_node=None, reserve=8):
+def plan(allowed, nodes, sib, q, gn, workers=48, per_node=None, reserve=4):
     """The CPU split. allowed: CPUs; nodes: {node: CPUs}; sib(cpu) -> its SMT siblings (itself included); q: the CPU
     quota or None; gn: the drafter's GPU's node or None. Returns (moe CPUs, watcher CPU or -1, server CPUs, note)."""
     cores = {}
@@ -135,13 +138,15 @@ def main():
     ap.add_argument("--workers", type=int, default=int(os.environ.get("VLLM_EXP_MTP_CPU_MOE_WORKERS", "48")))
     ap.add_argument("--per-node", type=int, default=None,
                     help="a fixed count per NUMA node instead of --workers (the earlier rule)")
-    ap.add_argument("--reserve", type=int, default=8, help="physical cores left to the server")
+    ap.add_argument("--reserve", type=int, default=int(os.environ.get("VLLM_EXP_MTP_CPU_MOE_RESERVE", "4")),
+                    help="physical cores left to the server (default 4)")
+    ap.add_argument("--min-workers", type=int, default=8)
     ap.add_argument("--gpu-bus-id", default="")
     a = ap.parse_args()
     allowed, nodes = topology()
     moe, watcher, server, note = plan(allowed, nodes, siblings, quota(), gpu_node(a.gpu_bus_id), a.workers,
                                       a.per_node, a.reserve)
-    if not moe or len(server) < 8:
+    if len(moe) < max(1, min(a.min_workers, a.workers)) or len(server) < max(1, a.reserve):
         raise SystemExit(f"mtp_cpu_plan: {len(moe)} MoE workers and {len(server)} CPUs for the server "
                          f"({len(allowed)} allowed); the CPU MoE needs a larger machine (or MTP=0)")
     print(f"MTP_MOE_CPUS={fmt(moe)}")
