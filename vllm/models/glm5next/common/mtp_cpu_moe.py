@@ -25,8 +25,9 @@ and their SMT siblings (mtp_cpu_plan.py prints a taskset list; vLLM binds GPU wo
 otherwise overlaps the workers), and pin the expert weights (default) so that automatic NUMA balancing does not keep
 unmapping them: its hinting faults stall a few workers at a time, and every call waits for the slowest.
 
-Environment: VLLM_EXP_MTP_CPU_MOE_CPUS (CPU list, e.g. "0-11,32-43"; default: the first
-VLLM_EXP_MTP_CPU_MOE_PER_NODE (12) physical cores of every NUMA node, capped below the container's CPU quota),
+Environment: VLLM_EXP_MTP_CPU_MOE_CPUS (CPU list, e.g. "0-11,32-43"; default: mtp_cpu_plan.py's choice,
+VLLM_EXP_MTP_CPU_MOE_WORKERS (48) physical cores spread evenly over the NUMA nodes, below the container's CPU quota;
+VLLM_EXP_MTP_CPU_MOE_PER_NODE: a fixed count per node instead),
 VLLM_EXP_MTP_CPU_MOE_PREFETCH (1024 bytes), VLLM_EXP_MTP_CPU_MOE_SPIN_US (3000: idle workers spin this long before
 they sleep), VLLM_EXP_MTP_CPU_MOE_PREWAKE (1: wake the workers at the start of the MTP layer),
 VLLM_EXP_MTP_CPU_MOE_PIN (1: pin the expert weights, which exempts them from automatic NUMA balancing),
@@ -96,8 +97,20 @@ def _cpu_quota() -> float | None:
         return None
 
 
-def default_cpus(per_node: int) -> list[int]:
-    """The first ``per_node`` physical cores (one thread each) of every NUMA node, capped below the CPU quota."""
+def default_cpus(per_node: int | None = None) -> list[int]:
+    """The workers' CPUs when VLLM_EXP_MTP_CPU_MOE_CPUS is not set: mtp_cpu_plan.py's choice (48 physical cores
+    spread over the NUMA nodes, below the CPU quota), or with ``per_node`` the first ``per_node`` cores of each."""
+    if per_node is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_mtp_cpu_plan", Path(__file__).with_name("mtp_cpu_plan.py"))
+        assert spec is not None and spec.loader is not None
+        plan = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plan)
+        allowed, nodes = plan.topology()
+        moe, _, _, _ = plan.plan(allowed, nodes, plan.siblings, plan.quota(), None,
+                                 workers=_env_int("VLLM_EXP_MTP_CPU_MOE_WORKERS", 48))
+        return moe
     nodes = sorted(int(p.name[4:]) for p in Path("/sys/devices/system/node").glob("node[0-9]*"))
     per_node_cores: list[list[int]] = []
     for n in nodes:
@@ -145,6 +158,16 @@ def build_cubin(arch: str) -> Path:
     return out
 
 
+def _cpu_identity() -> str:
+    """Vendor, family, model, model name and flags of the first CPU in /proc/cpuinfo."""
+    try:
+        block = Path("/proc/cpuinfo").read_text(errors="replace").split("\n\n", 1)[0]
+    except OSError:
+        return ""
+    keys = ("vendor_id", "cpu family", "model", "model name", "flags")
+    return "\n".join(line for line in block.splitlines() if line.split(":", 1)[0].strip() in keys)
+
+
 def _load_library(hidden: int, inter: int) -> ctypes.CDLL:
     key = (hidden, inter)
     if key in _LIBS:
@@ -153,7 +176,9 @@ def _load_library(hidden: int, inter: int) -> ctypes.CDLL:
         raise RuntimeError("VLLM_EXP_MTP_CPU_MOE needs a CPU with AVX512-BF16 (e.g. Sapphire Rapids or newer)")
     flags = ["-O3", "-march=native", "-mavx512bf16", "-fPIC", "-shared", "-pthread",
              f"-DCMOE_H={hidden}", f"-DCMOE_I={inter}"]
-    tag = hashlib.sha256(_SRC.read_bytes() + " ".join(flags).encode()).hexdigest()[:16]
+    # -march=native: a library built on one CPU model may use instructions another lacks, so the cache key includes
+    # the CPU (a home directory shared by machines with different CPUs).
+    tag = hashlib.sha256(_SRC.read_bytes() + " ".join(flags).encode() + _cpu_identity().encode()).hexdigest()[:16]
     cache = _cache_dir()
     so = cache / f"mtp_cpu_moe_{hidden}x{inter}_{tag}.so"
     if not so.exists():
@@ -396,7 +421,8 @@ class MtpCpuMoE(nn.Module):
         )
         self.max_rows = max(1, vllm_config.scheduler_config.max_num_seqs)
         spec = os.environ.get("VLLM_EXP_MTP_CPU_MOE_CPUS", "").strip()
-        cpus = _parse_list(spec) if spec else default_cpus(_env_int("VLLM_EXP_MTP_CPU_MOE_PER_NODE", 12))
+        per_node = os.environ.get("VLLM_EXP_MTP_CPU_MOE_PER_NODE", "").strip()
+        cpus = _parse_list(spec) if spec else default_cpus(int(per_node) if per_node else None)
         self.engine = CpuMoEEngine(
             config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, self.top_k, self.max_rows,
             config.swiglu_limit, cpus, prefetch=_env_int("VLLM_EXP_MTP_CPU_MOE_PREFETCH", 1024),
