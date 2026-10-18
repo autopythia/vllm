@@ -18,6 +18,12 @@
  * Barrier. Phase 2: out[r][h] += w * (down_h . act) for its h rows. Barrier. The calling thread (the CUDA driver's
  * host-function thread) only publishes the call and waits. Fixed thread layout: fixed summation order, so results
  * are bit-reproducible.
+ *
+ * Options (experiment): the software prefetch's target (cmoe_set_prefetch_hint: L1, L2, L3 or non-temporal; deeper
+ * prefetches into L2/L3 were ~14% faster on vast3's Xeon 6767P than into L1, whose 16 fill buffers bound a core's
+ * streaming rate), and INT8 weights (wbits 8 in cmoe_create): one FP32 scale per gate, up and down row (absmax/127,
+ * computed while the weights load), converted to FP32 in registers and multiplied with FP32 activations; half the
+ * bytes, so about half the time of a memory-bound call. Activations are not quantized.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -53,6 +59,7 @@
 
 typedef uint16_t bf16;
 static inline bf16 f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7fffu + ((u >> 16) & 1u); return (bf16)(u >> 16); }
+static inline float bf2f(bf16 b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 
 /* ---- errors ---- */
@@ -121,14 +128,15 @@ typedef struct cmoe cmoe_t;
 typedef struct {
   cmoe_t *c;
   int tid, cpu, j0, nj, h0, nh, pin_ok;
-  bf16 *w13, *w2;            /* [E][2][nj][H] (gate rows, then up rows), [E][nh][I] */
+  bf16 *w13, *w2;            /* [E][2][nj][H] (gate rows, then up rows), [E][nh][I]; wbits 8: int8_t */
+  float *s13, *s2;           /* wbits 8: row scales [E][2][nj], [E][nh] */
   size_t w13_bytes, w2_bytes;
   float *acc;                /* [max_rows][nh] */
   pthread_t th;
 } worker_t;
 
 struct cmoe {
-  int E, topk, max_rows, max_sel, T, pf, spin_us, nstarted;
+  int E, topk, max_rows, max_sel, T, pf, spin_us, nstarted, wbits, pf_hint;
   float limit;
   worker_t *W;
   uint8_t *map13, *map2; size_t len13, len2;
@@ -137,7 +145,8 @@ struct cmoe {
   int R, nrows, *rows_list, *comp, *src_of;
   int nsel, *sel_e, *sel_nt, *sel_tok, *slot_of_e; float *sel_w;
   const bf16 *xb;            /* [max_rows][H], in the input buffer */
-  bf16 *act;                 /* [max_sel][max_rows][I] */
+  bf16 *act;                 /* [max_sel][max_rows][I]; wbits 8: float, BF16-rounded values */
+  float *xf;                 /* wbits 8: the computed rows of x in FP32, [max_rows][H] */
   float *out;                /* [max_rows][H], the output buffer */
   /* a weight load */
   const bf16 *load_src; int load_e, load_which;
@@ -178,10 +187,19 @@ static void barrier(cmoe_t *c, int *sense) {
 }
 
 #define LD(p) ((__m512bh)_mm512_loadu_si512((const void *)(p)))
+static inline __attribute__((always_inline)) void pfetch(const void *p, const int hint) {
+  switch (hint) {
+    case 1: _mm_prefetch((const char *)p, _MM_HINT_T1); break;
+    case 2: _mm_prefetch((const char *)p, _MM_HINT_T2); break;
+    case 3: _mm_prefetch((const char *)p, _MM_HINT_NTA); break;
+    default: _mm_prefetch((const char *)p, _MM_HINT_T0);
+  }
+}
 
 /* gate row g and up row u (length H) against the x of n tokens */
 static inline __attribute__((always_inline)) void dot_gu(const bf16 *g, const bf16 *u, const bf16 *xb, const int *tok,
-                                                         const int n, const int pf, float *gs, float *us) {
+                                                         const int n, const int pf, const int hint, float *gs,
+                                                         float *us) {
   __m512 ag[4][2], au[4][2];
   const bf16 *xs[4];
   for (int i = 0; i < 4; i++) {
@@ -189,8 +207,8 @@ static inline __attribute__((always_inline)) void dot_gu(const bf16 *g, const bf
     for (int r = 0; r < 2; r++) { ag[i][r] = _mm512_setzero_ps(); au[i][r] = _mm512_setzero_ps(); }
   }
   for (int h = 0; h < H; h += 64) {
-    _mm_prefetch((const char *)(g + h) + pf, _MM_HINT_T0); _mm_prefetch((const char *)(g + h) + pf + 64, _MM_HINT_T0);
-    _mm_prefetch((const char *)(u + h) + pf, _MM_HINT_T0); _mm_prefetch((const char *)(u + h) + pf + 64, _MM_HINT_T0);
+    pfetch((const char *)(g + h) + pf, hint); pfetch((const char *)(g + h) + pf + 64, hint);
+    pfetch((const char *)(u + h) + pf, hint); pfetch((const char *)(u + h) + pf + 64, hint);
     __m512bh g0 = LD(g + h), g1 = LD(g + h + 32), u0 = LD(u + h), u1 = LD(u + h + 32);
     for (int i = 0; i < n; i++) {
       __m512bh a = LD(xs[i] + h), b = LD(xs[i] + h + 32);
@@ -206,11 +224,11 @@ static inline __attribute__((always_inline)) void dot_gu(const bf16 *g, const bf
 
 /* down row (length I) against n consecutive act rows */
 static inline __attribute__((always_inline)) void dot_w2(const bf16 *row, const bf16 *act, const int n, const int pf,
-                                                         float *d) {
+                                                         const int hint, float *d) {
   __m512 a[4][2];
   for (int i = 0; i < 4; i++) a[i][0] = a[i][1] = _mm512_setzero_ps();
   for (int j = 0; j < I; j += 64) {
-    _mm_prefetch((const char *)(row + j) + pf, _MM_HINT_T0); _mm_prefetch((const char *)(row + j) + pf + 64, _MM_HINT_T0);
+    pfetch((const char *)(row + j) + pf, hint); pfetch((const char *)(row + j) + pf + 64, hint);
     __m512bh w0 = LD(row + j), w1 = LD(row + j + 32);
     for (int i = 0; i < n; i++) {
       a[i][0] = _mm512_dpbf16_ps(a[i][0], w0, LD(act + (size_t)i * I + j));
@@ -220,9 +238,122 @@ static inline __attribute__((always_inline)) void dot_w2(const bf16 *row, const 
   for (int i = 0; i < n; i++) d[i] = _mm512_reduce_add_ps(_mm512_add_ps(a[i][0], a[i][1]));
 }
 
+/* wbits 8: 16 int8 weights -> 16 floats */
+#define Q16(p) _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(p))))
+/* int8 gate row g and up row u (length H) against the FP32 x of n rows; unscaled sums */
+static inline __attribute__((always_inline)) void dot_gu_q8(const int8_t *g, const int8_t *u, const float *xf,
+                                                            const int *tok, const int n, const int pf, const int hint,
+                                                            float *gs, float *us) {
+  __m512 ag[4][2], au[4][2];
+  const float *xs[4];
+  for (int i = 0; i < 4; i++) {
+    xs[i] = xf + (size_t)tok[i < n ? i : 0] * H;
+    for (int r = 0; r < 2; r++) { ag[i][r] = _mm512_setzero_ps(); au[i][r] = _mm512_setzero_ps(); }
+  }
+  for (int h = 0; h < H; h += 64) {
+    pfetch(g + h + pf, hint); pfetch(u + h + pf, hint);
+    const __m512 g0 = Q16(g + h), g1 = Q16(g + h + 16), g2 = Q16(g + h + 32), g3 = Q16(g + h + 48);
+    const __m512 u0 = Q16(u + h), u1 = Q16(u + h + 16), u2 = Q16(u + h + 32), u3 = Q16(u + h + 48);
+    for (int i = 0; i < n; i++) {
+      const float *x = xs[i] + h;
+      const __m512 x0 = _mm512_loadu_ps(x), x1 = _mm512_loadu_ps(x + 16);
+      const __m512 x2 = _mm512_loadu_ps(x + 32), x3 = _mm512_loadu_ps(x + 48);
+      ag[i][0] = _mm512_fmadd_ps(g0, x0, ag[i][0]); ag[i][1] = _mm512_fmadd_ps(g1, x1, ag[i][1]);
+      ag[i][0] = _mm512_fmadd_ps(g2, x2, ag[i][0]); ag[i][1] = _mm512_fmadd_ps(g3, x3, ag[i][1]);
+      au[i][0] = _mm512_fmadd_ps(u0, x0, au[i][0]); au[i][1] = _mm512_fmadd_ps(u1, x1, au[i][1]);
+      au[i][0] = _mm512_fmadd_ps(u2, x2, au[i][0]); au[i][1] = _mm512_fmadd_ps(u3, x3, au[i][1]);
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    gs[i] = _mm512_reduce_add_ps(_mm512_add_ps(ag[i][0], ag[i][1]));
+    us[i] = _mm512_reduce_add_ps(_mm512_add_ps(au[i][0], au[i][1]));
+  }
+}
+
+/* int8 down row (length I) against n consecutive FP32 act rows; unscaled */
+static inline __attribute__((always_inline)) void dot_w2_q8(const int8_t *row, const float *act, const int n,
+                                                            const int pf, const int hint, float *d) {
+  __m512 a[4][2];
+  for (int i = 0; i < 4; i++) a[i][0] = a[i][1] = _mm512_setzero_ps();
+  for (int j = 0; j < I; j += 64) {
+    pfetch(row + j + pf, hint);
+    const __m512 w0 = Q16(row + j), w1 = Q16(row + j + 16), w2 = Q16(row + j + 32), w3 = Q16(row + j + 48);
+    for (int i = 0; i < n; i++) {
+      const float *x = act + (size_t)i * I + j;
+      a[i][0] = _mm512_fmadd_ps(w0, _mm512_loadu_ps(x), a[i][0]);
+      a[i][1] = _mm512_fmadd_ps(w1, _mm512_loadu_ps(x + 16), a[i][1]);
+      a[i][0] = _mm512_fmadd_ps(w2, _mm512_loadu_ps(x + 32), a[i][0]);
+      a[i][1] = _mm512_fmadd_ps(w3, _mm512_loadu_ps(x + 48), a[i][1]);
+    }
+  }
+  for (int i = 0; i < n; i++) d[i] = _mm512_reduce_add_ps(_mm512_add_ps(a[i][0], a[i][1]));
+}
+
+static void run_moe_q8(worker_t *w, int *sense) {
+  cmoe_t *c = w->c;
+  const int MR = c->max_rows, pf = c->pf, hint = c->pf_hint;
+  const float lim = c->limit;
+  float *actf = (float *)c->act;
+  for (int k = 0; k < c->nsel; k++) {                /* phase 1: gate/up rows j0.. of every selected expert */
+    const int8_t *G = (const int8_t *)w->w13 + (size_t)c->sel_e[k] * 2 * w->nj * H, *U = G + (size_t)w->nj * H;
+    const float *SG = w->s13 + (size_t)c->sel_e[k] * 2 * w->nj, *SU = SG + w->nj;
+    const int nt = c->sel_nt[k];
+    const int *tok = c->sel_tok + (size_t)k * MR;
+    float *act = actf + (size_t)k * MR * I;
+    for (int jj = 0; jj < w->nj; jj++) {
+      const int8_t *g = G + (size_t)jj * H, *u = U + (size_t)jj * H;
+      for (int q0 = 0; q0 < nt; q0 += 4) {
+        const int n = nt - q0 < 4 ? nt - q0 : 4;
+        float gs[4], us[4];
+        switch (n) {
+          case 1: dot_gu_q8(g, u, c->xf, tok + q0, 1, pf, hint, gs, us); break;
+          case 2: dot_gu_q8(g, u, c->xf, tok + q0, 2, pf, hint, gs, us); break;
+          case 3: dot_gu_q8(g, u, c->xf, tok + q0, 3, pf, hint, gs, us); break;
+          default: dot_gu_q8(g, u, c->xf, tok + q0, 4, pf, hint, gs, us); break;
+        }
+        for (int i = 0; i < n; i++) {
+          float gv = gs[i] * SG[jj], uv = us[i] * SU[jj];
+          if (lim > 0.f) { gv = fminf(gv, lim); uv = fminf(fmaxf(uv, -lim), lim); }
+          act[(size_t)(q0 + i) * I + w->j0 + jj] = bf2f(f2bf(gv / (1.f + expf(-gv)) * uv));
+        }
+      }
+    }
+  }
+  barrier(c, sense);
+  memset(w->acc, 0, sizeof(float) * (size_t)MR * w->nh);
+  for (int k = 0; k < c->nsel; k++) {                /* phase 2: down rows h0.. of every selected expert */
+    const int8_t *W2e = (const int8_t *)w->w2 + (size_t)c->sel_e[k] * w->nh * I;
+    const float *S2 = w->s2 + (size_t)c->sel_e[k] * w->nh;
+    const int nt = c->sel_nt[k];
+    const int *tok = c->sel_tok + (size_t)k * MR;
+    const float *wt = c->sel_w + (size_t)k * MR;
+    const float *act = actf + (size_t)k * MR * I;
+    for (int hh = 0; hh < w->nh; hh++) {
+      const int8_t *row = W2e + (size_t)hh * I;
+      for (int q0 = 0; q0 < nt; q0 += 4) {
+        const int n = nt - q0 < 4 ? nt - q0 : 4;
+        float d[4];
+        switch (n) {
+          case 1: dot_w2_q8(row, act + (size_t)q0 * I, 1, pf, hint, d); break;
+          case 2: dot_w2_q8(row, act + (size_t)q0 * I, 2, pf, hint, d); break;
+          case 3: dot_w2_q8(row, act + (size_t)q0 * I, 3, pf, hint, d); break;
+          default: dot_w2_q8(row, act + (size_t)q0 * I, 4, pf, hint, d); break;
+        }
+        for (int i = 0; i < n; i++) w->acc[(size_t)tok[q0 + i] * w->nh + hh] += wt[q0 + i] * d[i] * S2[hh];
+      }
+    }
+  }
+  for (int m = 0; m < c->nrows; m++) {
+    const int r = c->rows_list[m];
+    memcpy(c->out + (size_t)r * H + w->h0, w->acc + (size_t)r * w->nh, sizeof(float) * w->nh);
+  }
+  barrier(c, sense);
+}
+
 static void run_moe(worker_t *w, int *sense) {
   cmoe_t *c = w->c;
-  const int MR = c->max_rows, pf = c->pf;
+  if (c->wbits == 8) { run_moe_q8(w, sense); return; }
+  const int MR = c->max_rows, pf = c->pf, hint = c->pf_hint;
   const float lim = c->limit;
   for (int k = 0; k < c->nsel; k++) {                /* phase 1: gate/up rows j0.. of every selected expert */
     const bf16 *G = w->w13 + (size_t)c->sel_e[k] * 2 * w->nj * H, *U = G + (size_t)w->nj * H;
@@ -235,10 +366,10 @@ static void run_moe(worker_t *w, int *sense) {
         const int n = nt - q0 < 4 ? nt - q0 : 4;
         float gs[4], us[4];
         switch (n) {
-          case 1: dot_gu(g, u, c->xb, tok + q0, 1, pf, gs, us); break;
-          case 2: dot_gu(g, u, c->xb, tok + q0, 2, pf, gs, us); break;
-          case 3: dot_gu(g, u, c->xb, tok + q0, 3, pf, gs, us); break;
-          default: dot_gu(g, u, c->xb, tok + q0, 4, pf, gs, us); break;
+          case 1: dot_gu(g, u, c->xb, tok + q0, 1, pf, hint, gs, us); break;
+          case 2: dot_gu(g, u, c->xb, tok + q0, 2, pf, hint, gs, us); break;
+          case 3: dot_gu(g, u, c->xb, tok + q0, 3, pf, hint, gs, us); break;
+          default: dot_gu(g, u, c->xb, tok + q0, 4, pf, hint, gs, us); break;
         }
         for (int i = 0; i < n; i++) {
           float gv = gs[i], uv = us[i];
@@ -262,10 +393,10 @@ static void run_moe(worker_t *w, int *sense) {
         const int n = nt - q0 < 4 ? nt - q0 : 4;
         float d[4];
         switch (n) {
-          case 1: dot_w2(row, act + (size_t)q0 * I, 1, pf, d); break;
-          case 2: dot_w2(row, act + (size_t)q0 * I, 2, pf, d); break;
-          case 3: dot_w2(row, act + (size_t)q0 * I, 3, pf, d); break;
-          default: dot_w2(row, act + (size_t)q0 * I, 4, pf, d); break;
+          case 1: dot_w2(row, act + (size_t)q0 * I, 1, pf, hint, d); break;
+          case 2: dot_w2(row, act + (size_t)q0 * I, 2, pf, hint, d); break;
+          case 3: dot_w2(row, act + (size_t)q0 * I, 3, pf, hint, d); break;
+          default: dot_w2(row, act + (size_t)q0 * I, 4, pf, hint, d); break;
         }
         for (int i = 0; i < n; i++) w->acc[(size_t)tok[q0 + i] * w->nh + hh] += wt[q0 + i] * d[i];
       }
@@ -278,10 +409,36 @@ static void run_moe(worker_t *w, int *sense) {
   barrier(c, sense);
 }
 
+/* wbits 8: n rows of length len, BF16 -> INT8 with one scale per row (absmax / 127, round to nearest) */
+static void quantize_rows(const bf16 *src, int8_t *dst, float *scale, const int n, const int len) {
+  for (int r = 0; r < n; r++) {
+    const bf16 *x = src + (size_t)r * len;
+    float amax = 0.f;
+    for (int i = 0; i < len; i++) amax = fmaxf(amax, fabsf(bf2f(x[i])));
+    const float sc = amax > 0.f ? amax / 127.f : 1.f, inv = 1.f / sc;
+    int8_t *q = dst + (size_t)r * len;
+    for (int i = 0; i < len; i++) {
+      long v = lrintf(bf2f(x[i]) * inv);
+      q[i] = (int8_t)(v > 127 ? 127 : v < -127 ? -127 : v);
+    }
+    scale[r] = sc;
+  }
+}
+
 static void run_load(worker_t *w, int *sense) {
   cmoe_t *c = w->c;
   const int e = c->load_e, which = c->load_which;
   const bf16 *src = c->load_src;
+  if (c->wbits == 8) {
+    if (which < 2)
+      quantize_rows(src + (size_t)w->j0 * H, (int8_t *)w->w13 + ((size_t)e * 2 + which) * w->nj * H,
+                    w->s13 + ((size_t)e * 2 + which) * w->nj, w->nj, H);
+    else
+      quantize_rows(src + (size_t)w->h0 * I, (int8_t *)w->w2 + (size_t)e * w->nh * I, w->s2 + (size_t)e * w->nh,
+                    w->nh, I);
+    barrier(c, sense);
+    return;
+  }
   if (which < 2) {                                   /* gate (0) or up (1): rows [I][H] */
     bf16 *dst = w->w13 + ((size_t)e * 2 + which) * w->nj * H;
     memcpy(dst, src + (size_t)w->j0 * H, sizeof(bf16) * (size_t)w->nj * H);
@@ -302,6 +459,11 @@ static void *worker_main(void *arg) {
   if (w->acc) memset(w->acc, 0, sizeof(float) * (size_t)c->max_rows * (w->nh + 16));
   memset(w->w13, 0, w->w13_bytes);                   /* first touch: the pages go to this thread's node */
   memset(w->w2, 0, w->w2_bytes);
+  if (c->wbits == 8) {
+    w->s13 = calloc((size_t)c->E * 2 * w->nj + 16, sizeof(float));
+    w->s2 = calloc((size_t)c->E * w->nh + 16, sizeof(float));
+    if (!w->s13 || !w->s2) { free(w->acc); w->acc = NULL; }   /* reported as out of memory by cmoe_create */
+  }
   atomic_fetch_add_explicit(&c->nready, 1, memory_order_acq_rel);
   for (;;) {
     int g;
@@ -355,17 +517,18 @@ void cmoe_destroy(cmoe_t *c);
 
 /* n_experts, top_k, max_rows: the call shape; cpus[n_threads]: one pinned worker per CPU; prefetch_bytes: software
  * prefetch distance in each weight stream (0: off); spin_us: how long idle workers spin before they sleep on a futex;
- * swiglu_limit: clamp of gate (max) and up (+-) before silu(gate) * up, 0 for none. Returns NULL on error. */
+ * swiglu_limit: clamp of gate (max) and up (+-) before silu(gate) * up, 0 for none; wbits: 16 (BF16 weights) or 8
+ * (INT8 with row scales). Returns NULL on error. */
 cmoe_t *cmoe_create(int n_experts, int top_k, int max_rows, const int *cpus, int n_threads, int prefetch_bytes,
-                    int spin_us, float swiglu_limit) {
-  if (n_experts < 1 || top_k < 1 || max_rows < 1 || n_threads < 1 || n_threads > 4096) {
+                    int spin_us, float swiglu_limit, int wbits) {
+  if (n_experts < 1 || top_k < 1 || max_rows < 1 || n_threads < 1 || n_threads > 4096 || (wbits != 16 && wbits != 8)) {
     set_err("bad arguments"); return NULL;
   }
   if (!__builtin_cpu_supports("avx512bf16")) { set_err("this CPU lacks AVX512-BF16"); return NULL; }
   cmoe_t *c = calloc(1, sizeof *c);
   if (!c) { set_err("out of memory"); return NULL; }
   c->E = n_experts; c->topk = top_k; c->max_rows = max_rows; c->max_sel = max_rows * top_k; c->T = n_threads;
-  c->pf = prefetch_bytes; c->spin_us = spin_us; c->limit = swiglu_limit;
+  c->pf = prefetch_bytes; c->spin_us = spin_us; c->limit = swiglu_limit; c->wbits = wbits;
   pthread_mutex_init(&c->call_lock, NULL);
   c->W = calloc(n_threads, sizeof(worker_t));
   c->rows_list = calloc(max_rows, sizeof(int)); c->comp = calloc(max_rows, sizeof(int));
@@ -374,8 +537,12 @@ cmoe_t *cmoe_create(int n_experts, int top_k, int max_rows, const int *cpus, int
   c->sel_tok = calloc((size_t)c->max_sel * max_rows, sizeof(int));
   c->sel_w = calloc((size_t)c->max_sel * max_rows, sizeof(float));
   c->slot_of_e = malloc(sizeof(int) * n_experts);
-  c->act_bytes = (sizeof(bf16) * (size_t)c->max_sel * max_rows * I + 4095) & ~(size_t)4095;
+  c->act_bytes = ((wbits == 8 ? sizeof(float) : sizeof(bf16)) * (size_t)c->max_sel * max_rows * I + 4095) &
+                 ~(size_t)4095;
   c->act = aligned_alloc(4096, c->act_bytes);
+  if (wbits == 8 && !(c->xf = aligned_alloc(64, sizeof(float) * (size_t)max_rows * H))) {
+    set_err("out of memory"); cmoe_destroy(c); return NULL;
+  }
   c->pin_weights = 1;
   c->loaded = calloc((size_t)n_experts * 3, 1);
   if (!c->W || !c->rows_list || !c->comp || !c->src_of || !c->sel_e || !c->sel_nt || !c->sel_tok || !c->sel_w ||
@@ -403,8 +570,8 @@ cmoe_t *cmoe_create(int n_experts, int top_k, int max_rows, const int *cpus, int
     w->c = c; w->tid = t; w->cpu = cpus[t];
     w->j0 = (int)((long)t * I / n_threads); w->nj = (int)((long)(t + 1) * I / n_threads) - w->j0;
     w->h0 = (int)((long)t * H / n_threads); w->nh = (int)((long)(t + 1) * H / n_threads) - w->h0;
-    w->w13_bytes = (size_t)n_experts * 2 * w->nj * H * sizeof(bf16);
-    w->w2_bytes = (size_t)n_experts * w->nh * I * sizeof(bf16);
+    w->w13_bytes = (size_t)n_experts * 2 * w->nj * H * (wbits / 8);
+    w->w2_bytes = (size_t)n_experts * w->nh * I * (wbits / 8);
     off13[t] = o13; o13 += (w->w13_bytes + al - 1) & ~(al - 1);
     off2[t] = o2; o2 += (w->w2_bytes + al - 1) & ~(al - 1);
   }
@@ -459,6 +626,8 @@ int cmoe_register_host_buffers(cmoe_t *c) {
   return 0;
 }
 void cmoe_set_pin_weights(cmoe_t *c, int on) { c->pin_weights = on; }
+/* the software prefetch's target: 0 L1 (T0), 1 L2 (T1), 2 L3 (T2), 3 non-temporal; and its distance in bytes */
+void cmoe_set_prefetch(cmoe_t *c, int bytes, int hint) { c->pf = bytes; c->pf_hint = hint & 3; }
 
 void cmoe_destroy(cmoe_t *c) {
   if (!c) return;
@@ -478,7 +647,8 @@ void cmoe_destroy(cmoe_t *c) {
   if (c->reg_act && p_cuMemHostUnregister) p_cuMemHostUnregister(c->act);
   if (c->map13) munmap(c->map13, c->len13);
   if (c->map2) munmap(c->map2, c->len2);
-  if (c->W) for (int t = 0; t < c->T; t++) free(c->W[t].acc);
+  if (c->W) for (int t = 0; t < c->T; t++) { free(c->W[t].acc); free(c->W[t].s13); free(c->W[t].s2); }
+  free(c->xf);
   free(c->W); free(c->rows_list); free(c->comp); free(c->src_of); free(c->sel_e); free(c->sel_nt);
   free(c->sel_tok); free(c->sel_w); free(c->slot_of_e); free(c->act); free(c->loaded); free(c->hin); free(c->hout);
   free(c);
@@ -531,6 +701,11 @@ static void compute(cmoe_t *c) {
     }
   }
   for (int s = 0; s < c->nsel; s++) c->slot_of_e[c->sel_e[s]] = -1;
+  if (c->wbits == 8)
+    for (int m = 0; m < c->nrows; m++) {
+      const int r = c->rows_list[m];
+      for (int h = 0; h < H; h++) c->xf[(size_t)r * H + h] = bf2f(c->xb[(size_t)r * H + h]);
+    }
   if (c->nsel > 0) dispatch(c, JOB_MOE);
   for (int r = 0; r < R; r++) {
     if (c->comp[r] && c->nsel > 0) continue;

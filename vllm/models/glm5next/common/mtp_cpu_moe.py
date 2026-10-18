@@ -34,6 +34,10 @@ VLLM_EXP_MTP_CPU_MOE_DOORBELL (1: the doorbell hand-off, built with nvcc; 0: CUD
 VLLM_EXP_MTP_CPU_MOE_WATCHER_CPU (-1: the watcher thread unpinned),
 VLLM_EXP_MTP_CPU_MOE_REPORT_S (0: a timing report to stderr every so many seconds), VLLM_EXP_MTP_CPU_MOE_MODE_FILE
 (a file holding 0 or 1, read at most every 0.2 s; 1 skips the CPU compute and returns zeros, for measurements).
+Options measured on the Xeon 6767P (exp/cpu_moe_bench.c): VLLM_EXP_MTP_CPU_MOE_PF_HINT (0: prefetch into L1, 1: L2,
+2: L3, 3: non-temporal; L2 at 4096 or L3 at 2048 bytes was ~14% faster than L1 at 1024 in the benchmark),
+VLLM_EXP_MTP_CPU_MOE_WBITS (16: BF16 weights; 8: INT8 with one FP32 scale per row, quantized at load, half the bytes
+and about half the time; changes the draft's numerics, not the target's).
 """
 
 import ctypes
@@ -167,7 +171,8 @@ def _load_library(hidden: int, inter: int) -> ctypes.CDLL:
     lib.cmoe_last_error.restype = ctypes.c_char_p
     lib.cmoe_create.restype = vp
     lib.cmoe_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
-                                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+                                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int]
+    lib.cmoe_set_prefetch.argtypes = [vp, ctypes.c_int, ctypes.c_int]
     lib.cmoe_destroy.argtypes = [vp]
     lib.cmoe_register_host_buffers.argtypes = [vp]
     lib.cmoe_set_weight.argtypes = [vp, ctypes.c_int, ctypes.c_int, vp]
@@ -201,16 +206,21 @@ class CpuMoEEngine:
     """ctypes wrapper of one mtp_cpu_moe.c engine: the expert weights in NUMA-local slices and the worker threads."""
 
     def __init__(self, num_experts: int, hidden: int, inter: int, top_k: int, max_rows: int,
-                 swiglu_limit: float | None, cpus: list[int], prefetch: int = 1024, spin_us: int = 3000):
+                 swiglu_limit: float | None, cpus: list[int], prefetch: int = 1024, spin_us: int = 3000,
+                 wbits: int = 16, prefetch_hint: int = 0):
         self.lib = _load_library(hidden, inter)
         self.num_experts, self.hidden, self.inter = num_experts, hidden, inter
         self.top_k, self.max_rows, self.cpus = top_k, max_rows, list(cpus)
         arr = (ctypes.c_int * len(cpus))(*cpus)
         t0 = time.monotonic()
+        if wbits not in (16, 8):
+            raise ValueError(f"mtp_cpu_moe: weight bits {wbits} (16 or 8)")
+        self.wbits = wbits
         self.h = self.lib.cmoe_create(num_experts, top_k, max_rows, arr, len(cpus), prefetch, spin_us,
-                                      float(swiglu_limit or 0.0))
+                                      float(swiglu_limit or 0.0), wbits)
         if not self.h:
             raise RuntimeError(f"mtp_cpu_moe: {self.lib.cmoe_last_error().decode()}")
+        self.lib.cmoe_set_prefetch(self.h, prefetch, prefetch_hint)
         self.create_s = time.monotonic() - t0
         self.in_bytes = self.lib.cmoe_in_bytes(self.h)
         self.out_bytes = self.lib.cmoe_out_bytes(self.h)
@@ -390,16 +400,18 @@ class MtpCpuMoE(nn.Module):
         self.engine = CpuMoEEngine(
             config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, self.top_k, self.max_rows,
             config.swiglu_limit, cpus, prefetch=_env_int("VLLM_EXP_MTP_CPU_MOE_PREFETCH", 1024),
-            spin_us=_env_int("VLLM_EXP_MTP_CPU_MOE_SPIN_US", 3000))
+            spin_us=_env_int("VLLM_EXP_MTP_CPU_MOE_SPIN_US", 3000), wbits=_env_int("VLLM_EXP_MTP_CPU_MOE_WBITS", 16),
+            prefetch_hint=_env_int("VLLM_EXP_MTP_CPU_MOE_PF_HINT", 0))
         self.prewake_enabled = _env_int("VLLM_EXP_MTP_CPU_MOE_PREWAKE", 1) == 1
         self.engine.configure(float(os.environ.get("VLLM_EXP_MTP_CPU_MOE_REPORT_S", "0") or 0),
                               os.environ.get("VLLM_EXP_MTP_CPU_MOE_MODE_FILE", ""))
         self.logger.info(
-            "MTP routed experts on the CPU: %d threads on CPUs %s (%.1f GB of BF16 weights, slices first-touched in "
-            "%.1f s), up to %d rows per draft forward",
+            "MTP routed experts on the CPU: %d threads on CPUs %s (%.1f GB of %s weights, slices first-touched in "
+            "%.1f s; prefetch %d B, hint %d), up to %d rows per draft forward",
             len(cpus), spec or ",".join(map(str, cpus)),
-            config.n_routed_experts * 3 * config.hidden_size * config.moe_intermediate_size * 2 / 1e9,
-            self.engine.create_s, self.max_rows)
+            config.n_routed_experts * 3 * config.hidden_size * config.moe_intermediate_size * self.engine.wbits / 8e9,
+            "INT8 (row scales)" if self.engine.wbits == 8 else "BF16", self.engine.create_s,
+            _env_int("VLLM_EXP_MTP_CPU_MOE_PREFETCH", 1024), _env_int("VLLM_EXP_MTP_CPU_MOE_PF_HINT", 0), self.max_rows)
         self.doorbell = _env_int("VLLM_EXP_MTP_CPU_MOE_DOORBELL", 1) == 1
         self.watcher_cpu = _env_int("VLLM_EXP_MTP_CPU_MOE_WATCHER_CPU", -1)
         self._counters: torch.Tensor | None = None
