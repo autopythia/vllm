@@ -611,6 +611,30 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def add_indexed_subfolder_files(
+    hf_weights_files: list[str], hf_folder: str, index_file: str
+) -> list[str]:
+    """Add the shards the index places in subfolders (e.g.
+    ``tensors/native-QB.safetensors``), which the top-level glob misses.
+    Missing ones are left for `filter_duplicate_safetensors_files` to report."""
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    present = set(hf_weights_files)
+    extra = sorted(
+        path
+        for path in {
+            os.path.join(hf_folder, file)
+            for file in set(weight_map.values())
+            if os.path.dirname(file)
+        }
+        if path not in present and os.path.isfile(path)
+    )
+    return hf_weights_files + extra
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """Exclude files that are not needed for inference.
 
