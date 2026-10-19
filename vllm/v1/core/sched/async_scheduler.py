@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -21,6 +23,19 @@ class AsyncScheduler(Scheduler):
         self.decode_stagger = self.pp_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             self.decode_stagger = 1
+        # Experiment: balance the decode groups of pipeline parallelism (on unless
+        # VLLM_EXP_PP_DECODE_BALANCE=0). See _balance_decode_groups.
+        self.balance_decode_groups = (
+            self.use_v2_model_runner
+            and self.decode_stagger > 1
+            and os.environ.get("VLLM_EXP_PP_DECODE_BALANCE", "1") != "0"
+        )
+        if self.balance_decode_groups:
+            logger.info(
+                "Balancing decode requests between the %d pipeline decode groups "
+                "(VLLM_EXP_PP_DECODE_BALANCE=0 turns it off).",
+                self.decode_stagger,
+            )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -55,6 +70,45 @@ class AsyncScheduler(Scheduler):
                 request.next_decode_eligible_step = (
                     self.current_step + self.decode_stagger
                 )
+        if self.balance_decode_groups:
+            self._balance_decode_groups(scheduler_output)
+
+    def _balance_decode_groups(self, scheduler_output: SchedulerOutput) -> None:
+        """Even out the pipeline's decode groups (experiment).
+
+        With the cadence above, a request decodes only in steps of one residue
+        modulo decode_stagger, fixed by the step in which its prefill ended.
+        Requests whose prefills end in the same step, e.g. requests sent
+        together, share a residue and leave the other steps empty, so the
+        pipeline stages take turns instead of working on several groups at once.
+        After each step, the requests just scheduled (due again in
+        decode_stagger steps) move to the least loaded residue while their
+        residue has at least two more requests due; a moved request skips the
+        steps up to its new residue, once. Newest decoders move first.
+        """
+        stagger = self.decode_stagger
+        step = self.current_step
+        # due[d]: running requests next due at step + 1 + d.
+        due = [0] * stagger
+        movable: list[Request] = []
+        for request in self.running:
+            d = request.next_decode_eligible_step - step - 1
+            if 0 <= d < stagger:
+                due[d] += 1
+                if (
+                    d == stagger - 1
+                    and request.request_id in scheduler_output.num_scheduled_tokens
+                ):
+                    movable.append(request)
+        movable.sort(key=lambda r: (r.num_output_tokens, r.request_id))
+        last = stagger - 1
+        for request in movable:
+            target = min(range(last), key=lambda i: (due[i], i))
+            if due[last] - due[target] < 2:
+                break
+            request.next_decode_eligible_step = step + 1 + target + stagger
+            due[last] -= 1
+            due[target] += 1
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
