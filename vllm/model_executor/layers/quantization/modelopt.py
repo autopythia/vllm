@@ -2554,6 +2554,9 @@ class ModelOptLinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = sum(output_partition_sizes)
+        # The activation dtype, which the FP8 Marlin (W8A16) kernel reads for
+        # its scales, as with Fp8LinearMethod.
+        layer.orig_dtype = params_dtype
         shapes = Shapes(output_partition_sizes, input_size_per_partition, params_dtype)
 
         self.wkey.create_weights(layer, WEIGHT, self.ctx, shapes, weight_loader)
