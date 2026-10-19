@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -17,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -42,6 +46,103 @@ from .model import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+
+logger = init_logger(__name__)
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _dequant_nvfp4(
+    weight: torch.Tensor, scale: torch.Tensor, scale_2: torch.Tensor
+) -> torch.Tensor:
+    """[N, K/2] uint8 (two E2M1 values, the low nibble first), [N, K/16] E4M3
+    scales and an FP32 multiplier -> [N, K] BF16 (ModelOpt's NVFP4)."""
+    table = torch.tensor(
+        _E2M1 + tuple(-x for x in _E2M1), dtype=torch.float32, device=weight.device
+    )
+    nibbles = torch.stack((weight & 0xF, weight >> 4), dim=-1).view(
+        weight.shape[0], -1
+    )
+    values = table[nibbles.long()]
+    n, k = values.shape
+    scales = scale.float() * scale_2.float()
+    return (values.view(n, k // 16, 16) * scales[..., None]).view(n, k).bfloat16()
+
+
+class _MtpWeightDequantizer:
+    """BF16 weights from the quantized MTP-layer tensors of mixed-precision
+    ModelOpt checkpoints.
+
+    The MTP layer is built in BF16: its module names are not in a checkpoint's
+    quantized-layer map, and the drafter's routed experts run on the CPU from
+    BF16 weights (mtp_cpu_moe.py). Local Inference Lab's ``qad2`` branches store
+    its attention, indexer and shared experts in MXFP8 (``weight`` E4M3 and
+    ``weight_scale`` E8M0 per 32, uint8) and its routed experts in W4A16 NVFP4
+    (``weight``: two E2M1 per uint8, ``weight_scale``: E4M3 per 16,
+    ``weight_scale_2``: FP32 multiplier). The parts arrive in any order; each
+    weight is passed on as BF16 once complete. An ``input_scale`` is not needed.
+    BF16 checkpoints have no such tensors and pass through unchanged. The
+    conversion runs on the GPU when there is one (on the CPU it took minutes
+    for the 864 expert matrices of an MTP layer).
+    """
+
+    _SUFFIXES = (".weight_scale_2", ".weight_scale", ".input_scale", ".weight")
+
+    def __init__(self) -> None:
+        self._parts: dict[str, dict[str, torch.Tensor]] = {}
+        self._done: set[str] = set()
+
+    def add(
+        self, name: str, tensor: torch.Tensor
+    ) -> tuple[str, torch.Tensor] | bool:
+        """False: not a quantized part (load as is). True: kept, nothing to
+        load yet. ``(name, weight)``: a complete weight, dequantized to BF16."""
+        suffix = next((s for s in self._SUFFIXES if name.endswith(s)), None)
+        if suffix is None:
+            return False
+        if suffix == ".weight" and tensor.dtype not in (
+            torch.float8_e4m3fn,
+            torch.uint8,
+        ):
+            return False
+        stem = name[: -len(suffix)]
+        if stem in self._done:
+            return True  # e.g. an input scale after its weight
+        parts = self._parts.setdefault(stem, {})
+        parts[suffix[1:]] = tensor
+        weight, scale = parts.get("weight"), parts.get("weight_scale")
+        if weight is None or scale is None:
+            return True
+        device = weight.device
+        if device.type == "cpu" and torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        if weight.dtype == torch.float8_e4m3fn and scale.dtype == torch.uint8:
+            out = dequant_mxfp8_to_bf16(weight.to(device), scale.to(device))
+        elif weight.dtype == torch.uint8 and scale.dtype == torch.float8_e4m3fn:
+            if "weight_scale_2" not in parts:
+                return True
+            out = _dequant_nvfp4(
+                weight.to(device),
+                scale.to(device),
+                parts["weight_scale_2"].to(device),
+            )
+        else:
+            raise ValueError(
+                f"{stem}: unsupported quantized MTP weight "
+                f"(weight {weight.dtype}, weight_scale {scale.dtype})"
+            )
+        del self._parts[stem]
+        self._done.add(stem)
+        return f"{stem}.weight", out
+
+    def finish(self) -> None:
+        pending = {
+            stem: sorted(parts)
+            for stem, parts in self._parts.items()
+            if set(parts) != {"input_scale"}
+        }
+        if pending:
+            raise ValueError(f"Incomplete quantized MTP weights: {pending}")
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -187,6 +288,15 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         self._fp8_heads = []
         for layer in self._mtp_layers:
             head = layer.shared_head.head
+            if head.weight.dtype != torch.bfloat16:
+                # A quantized LM head (e.g. MXFP8 in mixed-precision
+                # checkpoints) already reads 8-bit weights: draft from it.
+                logger.info(
+                    "MTP FP8 draft head not built: the LM head is %s already",
+                    head.weight.dtype,
+                )
+                self._fp8_heads = None
+                return
             if id(head) not in copies:
                 copies[id(head)] = Fp8Head(head.weight)
             self._fp8_heads.append(copies[id(head)])
@@ -400,6 +510,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
+        dequantizer = _MtpWeightDequantizer()
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -435,6 +546,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(name)
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+            dequantized = dequantizer.add(name, loaded_weight)
+            if dequantized is True:
+                continue
+            if dequantized is not False:
+                name, loaded_weight = dequantized
             if self._load_cpu_moe_expert(spec_layer, name, loaded_weight):
                 loaded_params.add(name)
                 continue
@@ -526,6 +642,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        dequantizer.finish()
         for layer in self.model.layers.values():
             if getattr(layer.mtp_block.mlp, "is_cpu_moe", False):
                 layer.mtp_block.mlp.finish_loading()

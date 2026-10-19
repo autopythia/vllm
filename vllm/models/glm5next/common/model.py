@@ -48,6 +48,9 @@ from vllm.model_executor.layers.mhc import (
     hc_expand,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
@@ -123,6 +126,15 @@ vision tower was trained with 1e-6. Serving with 1e-5 drifts the RMSNorm and
 produces repetitive/degraded image descriptions, so force the trained value
 regardless of the checkpoint field.
 """
+
+_OPTIONAL_FUSED = (
+    ".fused_qkv_a_proj",
+    ".in_proj_qkv",
+    ".in_proj_bfg_a",
+    ".in_proj_qkvbfg_a",
+)
+"""Fused projections a layer may lack: the MLA QKV-A fusion, and KDA's split
+(q|k|v, b|f_a|g_a) or merged (q|k|v|b|f_a|g_a) input GEMM (kda.py)."""
 
 
 def _is_moe(config: Glm5NextTextConfig) -> bool:
@@ -384,6 +396,15 @@ class Glm5NextDecoderLayer(nn.Module):
             # on MLA configs; narrow away the `int | None`.
             assert config.v_head_dim is not None
             assert config.kv_lora_rank is not None
+            # MLA projections are BF16 in the NVFP4 checkpoint. Mixed-precision
+            # ModelOpt checkpoints list the ones they quantize (unlisted ones
+            # stay BF16); the MTP layer's are dequantized at load (mtp.py).
+            mla_quant_config = (
+                quant_config
+                if isinstance(quant_config, ModelOptMixedPrecisionConfig)
+                and not is_mtp_layer
+                else None
+            )
             self.self_attn = Glm5NextMLAAttention(
                 vllm_config=vllm_config,
                 config=config,
@@ -396,7 +417,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=mla_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_use_nope,
@@ -896,6 +917,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Indexer: fuse wk and weights_proj
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
+            # KDA with a split input GEMM (mixed-precision checkpoints, see
+            # kda.py): q|k|v in their format, b|f_a|g_a BF16.
+            (".in_proj_qkv", ".q_proj", 0),
+            (".in_proj_qkv", ".k_proj", 1),
+            (".in_proj_qkv", ".v_proj", 2),
+            (".in_proj_bfg_a", ".b_proj", 0),
+            (".in_proj_bfg_a", ".f_a_proj", 1),
+            (".in_proj_bfg_a", ".g_a_proj", 2),
             # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
             (".in_proj_qkvbfg_a", ".q_proj", 0),
             (".in_proj_qkvbfg_a", ".k_proj", 1),
@@ -1003,8 +1032,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
+                # Fused modules that a layer may not have (QKV-A fusion; KDA's
+                # split or merged input GEMM): skip if absent here.
+                if param_name in _OPTIONAL_FUSED and name_mapped not in params_dict:
                     continue
                 name = name_mapped
                 # Skip loading extra bias for GPTQ models.
@@ -1197,6 +1227,11 @@ class Glm5NextForConditionalGeneration(
     # at load for mixed-precision Quark checkpoints.
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
+        # Mixed-precision ModelOpt checkpoints resolve fused modules per shard:
+        # MLA's q_a|kv_a fusion and KDA's split q|k|v and b|f_a|g_a GEMMs.
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_bfg_a": ["b_proj", "f_a_proj", "g_a_proj"],
     }
 
     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
@@ -1486,9 +1521,15 @@ def _try_load_fp8_attn_proj(
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
-    # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # If the model actually kept this projection quantized, let the normal path
+    # handle it: it has a weight_scale_inv param, or a weight_scale param for
+    # ModelOpt formats (mixed-precision checkpoints: block-FP8 MLA, MXFP8 KDA
+    # o_proj). The same if the layer is on another pipeline stage.
+    if (
+        target_w not in params_dict
+        or target_s in params_dict
+        or f"{layer_prefix}.{target_base}.weight_scale" in params_dict
+    ):
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})

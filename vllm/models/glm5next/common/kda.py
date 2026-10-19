@@ -38,6 +38,9 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
@@ -160,6 +163,28 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
+def _kda_split_input_projection(quant_config, prefix: str) -> bool:
+    """Whether this KDA layer's input GEMM splits in two.
+
+    The NVFP4 and FP8 checkpoints keep all KDA projections BF16: one fused
+    q|k|v|b|f_a|g_a GEMM. Mixed-precision ModelOpt checkpoints (e.g. Local
+    Inference Lab's ``qad2-kda-w8a16``) quantize q/k/v (MXFP8) but keep b, f_a
+    and g_a BF16; a GEMM has one format, so they run as q|k|v and b|f_a|g_a.
+    """
+    if not isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        return False
+    resolve = quant_config._resolve_quant_algo
+    qkv = {resolve(f"{prefix}.{name}") for name in ("q_proj", "k_proj", "v_proj")}
+    gates = {resolve(f"{prefix}.{name}") for name in ("b_proj", "f_a_proj", "g_a_proj")}
+    if gates != {None} or len(qkv) != 1:
+        raise NotImplementedError(
+            f"{prefix}: KDA projection formats not supported: q/k/v {qkv}, "
+            f"b/f_a/g_a {gates} (supported: all BF16, or q/k/v in one format "
+            "with b/f_a/g_a BF16)"
+        )
+    return qkv != {None}
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
@@ -214,6 +239,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config
+        # Mixed-precision ModelOpt checkpoints list every projection they
+        # quantize; those keep their format, the others resolve to BF16.
+        if isinstance(saved_quant_config, ModelOptMixedPrecisionConfig):
+            self.quant_config = saved_quant_config
+        self.split_input_projection = _kda_split_input_projection(
+            self.quant_config, prefix
+        )
 
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
@@ -233,25 +265,46 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             max_num_tokens=vllm_config.scheduler_config.max_num_seqs,
         )
 
-        # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
-        # Order matches checkpoint's fused_qkvbfg_a_proj convention.
-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
-            self.hidden_size,
-            [
-                projection_size,  # q (shard 0)
-                projection_size,  # k (shard 1)
-                projection_size,  # v (shard 2)
-                self.num_heads,  # b (shard 3)
-                self.head_dim,  # f_a (shard 4, replicated)
-                self.head_dim,  # g_a (shard 5, replicated)
-            ],
-            replicated_shard_ids=(4, 5),
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvbfg_a",
-        )
+        if self.split_input_projection:
+            # q|k|v in the checkpoint's format, b|f_a|g_a BF16 (shards 1 and 2
+            # replicated across TP ranks).
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                self.hidden_size,
+                [projection_size] * 3,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_bfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [self.num_heads, self.head_dim, self.head_dim],
+                replicated_shard_ids=(1, 2),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_bfg_a",
+            )
+        else:
+            # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1
+            # launches). Order matches checkpoint's fused_qkvbfg_a_proj
+            # convention. Shards 4 (f_a) and 5 (g_a) are replicated across TP
+            # ranks.
+            self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [
+                    projection_size,  # q (shard 0)
+                    projection_size,  # k (shard 1)
+                    projection_size,  # v (shard 2)
+                    self.num_heads,  # b (shard 3)
+                    self.head_dim,  # f_a (shard 4, replicated)
+                    self.head_dim,  # g_a (shard 5, replicated)
+                ],
+                replicated_shard_ids=(4, 5),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvbfg_a",
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -456,17 +509,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
+        if self.split_input_projection:
+            qkv = self.in_proj_qkv(hidden_states)[0]
+            beta_raw, f_a, g_a = self.in_proj_bfg_a(hidden_states)[0].split(
+                [self.local_num_heads, self.head_dim, self.head_dim], dim=-1
+            )
+        else:
+            # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 GEMMs).
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+            qkv, beta_raw, f_a, g_a = projected.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
 
         # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
         # at load (SIGMOID_BETA), and only the chunked prefill path needs the
