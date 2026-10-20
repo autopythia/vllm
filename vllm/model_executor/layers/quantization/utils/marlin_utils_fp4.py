@@ -46,10 +46,13 @@ def _nvfp4_compute_scale_factor(
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
 
-    ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
+    # The largest positive scale is the overall maximum when that is positive
+    # (else no scale is positive and no rescaling applies): taken directly, it
+    # needs no FP32 copy and no mask index of all scales, which for a whole
+    # MoE layer's scales came to several GiB at load (GLM-5.3 MTP experts on
+    # the GPU: 6.75 GiB of int64 indices for 288 experts).
+    max_val = marlin_scales.max().float() * (2**7)
+    if max_val > 0:
         if max_val < 448 * (2**7):
             sf = (448 * (2**7) / max_val).log2().floor().exp2()
             return sf.item()
