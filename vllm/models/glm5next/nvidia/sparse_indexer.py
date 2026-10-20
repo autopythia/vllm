@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.models.glm5next.nvidia.deepselect_topk import deepselect_topk_
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
@@ -957,19 +958,34 @@ def sparse_attn_indexer_kpool(
         fast_det = (
             envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK and _fast_deterministic_topk()
         )
-        get_indexer_topk(
-            "torch"
-            if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK and not fast_det
-            else topk_backend
-        )(
-            logits,
-            seq_lens,
-            next_n,
-            topk_dst,
-            select_k,
-            attn_metadata_narrowed.max_seq_len,
+        # VLLM_EXP_INDEXER_DEEPSELECT=1: DeepSelect's deterministic top-k
+        # (deepselect_topk.py), already in _maybe_sort_topk_'s order; rows
+        # are pools when index_kpool > 1 (max_seq_len counts tokens)
+        dsel = (
+            envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK
+            and dcp_world_size <= 1
+            and deepselect_topk_(
+                logits,
+                SparseIndexerTopk._row_ends(seq_lens, next_n, logits.shape[0]),
+                topk_dst,
+                select_k,
+                -(-attn_metadata_narrowed.max_seq_len // max(index_kpool, 1)) + 1,
+            )
         )
-        if fast_det:
+        if not dsel:
+            get_indexer_topk(
+                "torch"
+                if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK and not fast_det
+                else topk_backend
+            )(
+                logits,
+                seq_lens,
+                next_n,
+                topk_dst,
+                select_k,
+                attn_metadata_narrowed.max_seq_len,
+            )
+        if fast_det and not dsel:
             _deterministic_topk_compact_(
                 logits,
                 None,
@@ -987,7 +1003,7 @@ def sparse_attn_indexer_kpool(
             dcp_world_size,
             pool_cp_interleave,
         )
-        if not (fast_det and dcp_world_size <= 1):  # else already in this order
+        if not dsel and not (fast_det and dcp_world_size <= 1):  # else in order
             _maybe_sort_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
