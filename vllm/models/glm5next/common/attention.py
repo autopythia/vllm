@@ -211,6 +211,31 @@ def _indexer_skinny_max_m() -> int:
     return max(0, min(16, max_m))
 
 
+def _indexer_ll_bf16_max_m() -> int:
+    """Experiment (KH13): rows up to which the indexer computes k and its
+    head weights with one GEMM, vLLM's cuteDSL ``ll_bf16_gemm`` (BF16 inputs,
+    FP32 output) over ``wk_weights_proj``, instead of a BF16 GEMM whose 32
+    head-weight columns are dropped and recomputed in FP32 from a
+    ``hidden_states.float()`` copy (a copy, an FP32 GEMM and a split-K reduce,
+    ~14 us per MLA layer at 3 rows on sm_120). k is rounded to BF16 before its
+    layer_norm, as before (the same k in tests); the head weights' FP32 sums
+    run in another order. On with
+    ``VLLM_EXP_INDEXER_LL_BF16=1`` on sm_120 (rows up to
+    ``VLLM_EXP_INDEXER_LL_BF16_MAX_M``, default 16); prefill is unchanged."""
+    if os.environ.get("VLLM_EXP_INDEXER_LL_BF16", "0") != "1":
+        return 0
+    if not current_platform.is_cuda() or not (
+        current_platform.is_device_capability_family(120)
+    ):
+        return 0
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import is_available
+
+    if not is_available():
+        return 0
+    max_m = int(os.environ.get("VLLM_EXP_INDEXER_LL_BF16_MAX_M", "16"))
+    return max(0, min(16, max_m))
+
+
 def _indexer_linear(x: torch.Tensor, weight: torch.Tensor, max_m: int) -> torch.Tensor:
     """``x @ weight.T`` for the indexer's small BF16 projections: the skinny
     GEMM for 1..``max_m`` rows when its layout constraints hold, else
@@ -309,6 +334,16 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
+        self._ll_bf16_max_m = _indexer_ll_bf16_max_m()
+        if self._ll_bf16_max_m:
+            # (K, N) for vLLM's ll_bf16 warmup (kernel_warmup.py), which
+            # compiles its kernels before CUDA-graph capture.
+            self.ll_bf16_warmup_shapes = ((hidden_size, self.head_dim + self.n_head),)
+            logger.info_once(
+                "GLM-5.3 indexer: k and head weights from one FP32-output GEMM "
+                "(ll_bf16_gemm) at 1-%d rows (VLLM_EXP_INDEXER_LL_BF16)",
+                self._ll_bf16_max_m,
+            )
         self._skinny_max_m = _indexer_skinny_max_m()
         if self._skinny_max_m:
             from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
@@ -378,6 +413,33 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
+        m = hidden_states.shape[0]
+        if (
+            self._ll_bf16_max_m
+            and 1 <= m <= self._ll_bf16_max_m
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        ):
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+                ll_bf16_gemm,
+            )
+
+            kw32 = ll_bf16_gemm(hidden_states, self.wk_weights_proj.weight)
+            # Round k to BF16 in its own op: inside one compiled graph the
+            # BF16 round trip would be dropped (no precision-cast emulation),
+            # changing k. Rounded, k equals the BF16 GEMM's output (both are
+            # correctly rounded: FP32 sums of exact products).
+            k = _fused_indexer_k_norm(
+                kw32[:, : self.head_dim].to(torch.bfloat16),
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.head_dim,
+                self.k_norm.eps,
+            )
+            weights = kw32[:, self.head_dim :]
+            return self._forward_rest(
+                hidden_states, q, k, weights, positions, rotary_emb
+            )
         if self._skinny_max_m:
             kw = _indexer_linear(
                 hidden_states, self.wk_weights_proj.weight, self._skinny_max_m
@@ -397,7 +459,18 @@ class Indexer(nn.Module):
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
         )
+        return self._forward_rest(hidden_states, q, k, weights, positions, rotary_emb)
 
+    def _forward_rest(
+        self,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        positions,
+        rotary_emb,
+    ) -> torch.Tensor:
+        """The indexer after k (normed, BF16) and its FP32 head weights."""
         if self.rope_dim > 0:
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1

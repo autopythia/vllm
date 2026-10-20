@@ -64,6 +64,8 @@ def _ll_bf16_router_shapes_from_model(
 
     shapes: set[tuple[int, int]] = set()
     for module in model.modules():
+        # Other users of ll_bf16_gemm declare their (K, N) shapes here.
+        shapes.update(getattr(module, "ll_bf16_warmup_shapes", ()))
         if not isinstance(module, GateLinear):
             continue
         weight = getattr(module, "weight", None)
