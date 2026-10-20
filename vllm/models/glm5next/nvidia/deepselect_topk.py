@@ -6,13 +6,15 @@ With ``VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK=1`` the decode rows' top-k runs
 ``torch.topk`` plus a sort: deterministic, but 100-170 us per call.
 ``VLLM_EXP_INDEXER_DEEPSELECT=1`` runs DeepSeek's DeepSelect kernel instead
 (MIT, github.com/deepseek-ai/deepselect), built for sm_120 into the shared
-library named by ``VLLM_EXP_DEEPSELECT_LIB`` (a C ABI, loaded with ctypes). A
-row's selection depends only on that row, so the result is deterministic and
-independent of the batch; the indices come out in the order
-``_maybe_sort_topk_`` gives (descending, -1 last). Rows up to
-``VLLM_EXP_DEEPSELECT_SINGLE_MAX`` columns (default 163840, where the two
-ways cost the same per call on an RTX PRO 6000) run in one pass; longer ones
-are cut into slices that are selected in parallel, then merged.
+library named by ``VLLM_EXP_DEEPSELECT_LIB`` (a C ABI, loaded with ctypes). In
+one pass a row's selection depends only on that row, so the result is
+deterministic and independent of the batch; the indices come out in the order
+``_maybe_sort_topk_`` gives (descending, -1 last). Every row runs in one
+pass by default. ``VLLM_EXP_DEEPSELECT_SINGLE_MAX=N`` cuts the rows of a
+batch whose longest row exceeds N columns into slices that are selected in
+parallel, then merged: ~10 us faster per call at 196K-column rows, but among
+exactly tied logits a row's selection then depends on the batch's longest
+row, so the result is no longer independent of the batch.
 """
 
 import ctypes
@@ -25,7 +27,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_SINGLE_MAX = int(os.environ.get("VLLM_EXP_DEEPSELECT_SINGLE_MAX", "163840"))
+_SINGLE_MAX = int(os.environ.get("VLLM_EXP_DEEPSELECT_SINGLE_MAX") or 2**31 - 1)
 _MIN_WORKSPACE = 4 << 20
 _P = ctypes.c_void_p
 _I = ctypes.c_int
@@ -50,9 +52,11 @@ def _lib():
     lib.dsel_workspace_bytes.argtypes = [_I, _I, _LL, _I, _I]
     lib.dsel_last_error.restype = ctypes.c_char_p
     logger.info(
-        "Indexer decode top-k: DeepSelect from %s (one pass up to %d columns)",
+        "Indexer decode top-k: DeepSelect from %s (%s)",
         path,
-        _SINGLE_MAX,
+        "one pass"
+        if _SINGLE_MAX >= 2**31 - 1
+        else f"two passes above {_SINGLE_MAX} columns",
     )
     return lib
 
