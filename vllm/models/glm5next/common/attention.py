@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -184,6 +186,60 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         return KpoolTailBackend
 
 
+def _indexer_skinny_max_m() -> int:
+    """Experiment (KH3): rows up to which the indexer's two small BF16
+    projections (``wk_weights_proj``, 160 x 4096, and the kpool gate,
+    128 x 4096) use vLLM's CuTe DSL skinny GEMM instead of cuBLAS; 0 = off.
+    On sm_120 cuBLAS picks a slow WMMA kernel for these shapes at 2 and 3
+    rows (one request verifying one or two drafts): 25.6 us against 3-4 us
+    at 1 or 4+ rows; the skinny GEMM takes 2.1-2.5 us (exp/skinny_bench.py,
+    weights not in L2, e119). On with ``VLLM_EXP_INDEXER_SKINNY_GEMM=1``;
+    ``VLLM_EXP_INDEXER_SKINNY_MAX_M`` (default 6) bounds the rows."""
+    if os.environ.get("VLLM_EXP_INDEXER_SKINNY_GEMM", "0") != "1":
+        return 0
+    if not current_platform.is_cuda() or not (
+        current_platform.is_device_capability_family(120)
+    ):
+        return 0
+    from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    if not shape_dynamic_skinny_gemm.is_available():
+        return 0
+    max_m = int(os.environ.get("VLLM_EXP_INDEXER_SKINNY_MAX_M", "6"))
+    return max(0, min(16, max_m))
+
+
+def _indexer_linear(x: torch.Tensor, weight: torch.Tensor, max_m: int) -> torch.Tensor:
+    """``x @ weight.T`` for the indexer's small BF16 projections: the skinny
+    GEMM for 1..``max_m`` rows when its layout constraints hold, else
+    ``F.linear`` (never an error during CUDA-graph capture)."""
+    m = x.shape[0]
+    if (
+        max_m
+        and 1 <= m <= max_m
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.dim() == 2
+        and weight.is_contiguous()
+    ):
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            row_stride_ok,
+            shape_dynamic_skinny_gemm,
+        )
+
+        n, k = weight.shape
+        config = shape_dynamic_skinny_gemm._config(m, n, k)
+        if (
+            n % config.outputs_per_block == 0
+            and k % (config.block_size * config.vector_width) == 0
+            and row_stride_ok(x, config)
+        ):
+            return shape_dynamic_skinny_gemm(x, weight, config)
+    return F.linear(x, weight)
+
+
 class Indexer(nn.Module):
     def __init__(
         self,
@@ -253,6 +309,26 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
+        self._skinny_max_m = _indexer_skinny_max_m()
+        if self._skinny_max_m:
+            from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+                shape_dynamic_skinny_gemm,
+            )
+
+            # compiled before CUDA-graph capture (kernel warmup)
+            shape_dynamic_skinny_gemm.request_warmup_configs(
+                torch.bfloat16,
+                {
+                    shape_dynamic_skinny_gemm._config(m, n, hidden_size)
+                    for m in range(1, self._skinny_max_m + 1)
+                    for n in (self.head_dim + self.n_head, self.head_dim)
+                },
+            )
+            logger.info_once(
+                "GLM-5.3 indexer: the skinny GEMM for its small projections at "
+                "1-%d rows (VLLM_EXP_INDEXER_SKINNY_GEMM)",
+                self._skinny_max_m,
+            )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -302,7 +378,12 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
+        if self._skinny_max_m:
+            kw = _indexer_linear(
+                hidden_states, self.wk_weights_proj.weight, self._skinny_max_m
+            )
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         if self._wp_fp32 is None:
             self._wp_fp32 = (
@@ -358,7 +439,9 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        gate_score = _indexer_linear(
+            hidden_states, self.index_kpool_compress_gate, self._skinny_max_m
+        )
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
