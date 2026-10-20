@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 
 import vllm._custom_ops as ops
@@ -305,9 +307,18 @@ def _repack_marlin_experts(
     size_n: int,
     size_k: int,
     is_a_8bit: bool,
+    in_place: bool = False,
 ) -> torch.Tensor:
-    """Repack each expert to marlin format into a preallocated output."""
+    """Repack each expert to marlin format into a preallocated output.
+
+    ``in_place``: the output reuses the input's storage when an expert's
+    marlin layout has the same bytes as its input (4-bit to 4-bit), so the
+    repack needs one expert's temporaries instead of a second full-size copy
+    (with the caller still holding the original weights). Expert i is copied
+    out before its slot is overwritten; ``weight`` itself must not be used
+    afterwards, so only callers that replace it may ask for this."""
     num_experts = weight.shape[0]
+    in_place = in_place and weight.is_contiguous()
     out: torch.Tensor | None = None
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
@@ -319,11 +330,16 @@ def _repack_marlin_experts(
             is_a_8bit=is_a_8bit,
         )
         if out is None:
-            out = torch.empty(
-                (num_experts, *marlin_qweight.shape),
-                dtype=marlin_qweight.dtype,
-                device=marlin_qweight.device,
-            )
+            nbytes = marlin_qweight.numel() * marlin_qweight.element_size()
+            if in_place and nbytes == weight[0].numel() * weight.element_size():
+                out = weight.view(-1).view(marlin_qweight.dtype)
+                out = out.view(num_experts, *marlin_qweight.shape)
+            else:
+                out = torch.empty(
+                    (num_experts, *marlin_qweight.shape),
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
         out[i] = marlin_qweight
     assert out is not None
     return out
@@ -400,7 +416,10 @@ def prepare_nvfp4_moe_layer_for_marlin(
             weight = pad_w2(weight, packing=2)
             size_k = padded_N
 
-        return _repack_marlin_experts(weight, size_n, size_k, is_a_8bit)
+        # Experiment (VLLM_EXP_MARLIN_REPACK_IN_PLACE=1): the caller replaces
+        # the layer's weights with the result, so the repack may reuse them.
+        in_place = os.environ.get("VLLM_EXP_MARLIN_REPACK_IN_PLACE", "0") == "1"
+        return _repack_marlin_experts(weight, size_n, size_k, is_a_8bit, in_place)
 
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")
