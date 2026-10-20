@@ -49,11 +49,32 @@ from .model import (
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
+    mtp_keeps_quantized_linears,
 )
 
 logger = init_logger(__name__)
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+# KH8: the MTP-layer projections served in MXFP8 when mtp_keeps_quantized_linears(),
+# grouped by the model's fused modules (fused_qkv_a_proj, the shared experts'
+# gate_up_proj), whose shards must share one format. kv_b_proj (MLA absorbs it
+# into BF16 matrices) and the indexer (its fused wk_weights_proj and the skinny
+# GEMM of patch 0028 expect BF16) stay dequantized.
+_MTP_MXFP8_LINEAR_GROUPS = (
+    ("self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa"),
+    ("self_attn.q_b_proj",),
+    ("self_attn.o_proj",),
+    ("mlp.shared_experts.gate_proj", "mlp.shared_experts.up_proj"),
+    ("mlp.shared_experts.down_proj",),
+)
+# Checkpoint projection -> the model's fused module that holds it.
+_FUSED_PROJ = {
+    "q_a_proj": "fused_qkv_a_proj",
+    "kv_a_proj_with_mqa": "fused_qkv_a_proj",
+    "gate_proj": "gate_up_proj",
+    "up_proj": "gate_up_proj",
+}
 
 
 def _alias_mtp_expert_quantization(quant_config, config) -> None:
@@ -64,7 +85,9 @@ def _alias_mtp_expert_quantization(quant_config, config) -> None:
     Such checkpoints list them under the multimodal name
     (``model.language_model.layers.N.mlp.experts``); the MTP model builds
     ``model.layers.N.mlp.experts``. Only the routed experts get an alias: the
-    layer's other quantized weights are dequantized at load, as before."""
+    layer's other quantized weights are dequantized at load, as before, unless
+    mtp_keeps_quantized_linears() (KH8): then its MXFP8 attention projections
+    and shared experts get one too (_MTP_MXFP8_LINEAR_GROUPS)."""
     if mtp_cpu_moe.enabled() or not isinstance(
         quant_config, ModelOptMixedPrecisionConfig
     ):
@@ -87,6 +110,37 @@ def _alias_mtp_expert_quantization(quant_config, config) -> None:
                     layers[source].get("quant_algo"),
                     source,
                 )
+        if not mtp_keeps_quantized_linears():
+            continue
+        kept = []
+        for group in _MTP_MXFP8_LINEAR_GROUPS:
+            found = {}
+            for suffix in group:
+                for base in (
+                    f"model.language_model.layers.{n}",
+                    f"language_model.model.layers.{n}",
+                ):
+                    if f"{base}.{suffix}" in layers:
+                        found[suffix] = layers[f"{base}.{suffix}"]
+                        break
+            algos = {str(info.get("quant_algo", "")).upper() for info in found.values()}
+            if len(found) != len(group) or algos != {"MXFP8"}:
+                continue  # all shards of a fused module in MXFP8, or none
+            for suffix, info in found.items():
+                layers.setdefault(f"model.layers.{n}.{suffix}", info)
+                # The fused module's own name too, for a quant config without
+                # the model's packed-module mapping.
+                module, _, proj = suffix.rpartition(".")
+                if proj in _FUSED_PROJ:
+                    fused = f"model.layers.{n}.{module}.{_FUSED_PROJ[proj]}"
+                    layers.setdefault(fused, info)
+            kept += group
+        logger.info(
+            "MTP layer %d: %d projections kept in MXFP8 (KH8): %s",
+            n,
+            len(kept),
+            ", ".join(kept) or "none",
+        )
 
 
 def _dequant_nvfp4(
@@ -517,6 +571,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             cache[spec_layer] = w13 is not None and not w13.dtype.is_floating_point
         return cache[spec_layer]
 
+    def _keeps_quantized_linear(self, name: str, params_dict: dict) -> bool:
+        """A tensor of an MTP-layer projection that the model built quantized
+        (KH8: ModelOpt's MXFP8 linear method, an FP8 ``weight`` with a
+        ``weight_scale``): loaded as stored rather than dequantized to BF16."""
+        if ".mlp.experts." in name or not mtp_keeps_quantized_linears():
+            return False
+        stem, _, leaf = name.rpartition(".")
+        if leaf not in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+            return False
+        module, _, proj = stem.rpartition(".")
+        held = f"{module}.{_FUSED_PROJ.get(proj, proj)}"
+        weight = params_dict.get(f"{held}.weight")
+        return (
+            weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and f"{held}.weight_scale" in params_dict
+        )
+
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         spec_layer_weight_names = [
             "embed_tokens",
@@ -567,6 +639,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
         dequantizer = _MtpWeightDequantizer()
+        kept_quantized = 0  # KH8: projection weights loaded in MXFP8
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -602,7 +675,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(name)
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
-            if not self._keeps_quantized_experts(spec_layer, name):
+            keeps_linear = self._keeps_quantized_linear(name, params_dict)
+            if keeps_linear and name.endswith(".weight"):
+                kept_quantized += 1
+            if not (keeps_linear or self._keeps_quantized_experts(spec_layer, name)):
                 dequantized = dequantizer.add(name, loaded_weight)
                 if dequantized is True:
                     continue
@@ -700,6 +776,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             loaded_params.add(name)
 
         dequantizer.finish()
+        if mtp_keeps_quantized_linears():
+            logger.info(
+                "MTP: %d projection weights loaded quantized (KH8), the others "
+                "dequantized to BF16",
+                kept_quantized,
+            )
         for layer in self.model.layers.values():
             if getattr(layer.mtp_block.mlp, "is_cpu_moe", False):
                 layer.mtp_block.mlp.finish_loading()

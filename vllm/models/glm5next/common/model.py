@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -136,6 +137,17 @@ _OPTIONAL_FUSED = (
 """Fused projections a layer may lack: the MLA QKV-A fusion, and KDA's split
 (q|k|v, b|f_a|g_a) or merged (q|k|v|b|f_a|g_a) input GEMM (kda.py)."""
 
+
+
+def mtp_keeps_quantized_linears() -> bool:
+    """Experiment (KH8, ``VLLM_EXP_MTP_MXFP8_LINEARS=1``, with the MTP layer's
+    routed experts on the GPU): a mixed-precision ModelOpt checkpoint's MXFP8
+    MTP-layer attention projections and shared experts are served in MXFP8
+    instead of dequantized to BF16 at load (mtp.py aliases them)."""
+    return (
+        os.environ.get("VLLM_EXP_MTP_MXFP8_LINEARS", "0") == "1"
+        and not mtp_cpu_moe.enabled()
+    )
 
 def _is_moe(config: Glm5NextTextConfig) -> bool:
     return config.n_routed_experts is not None
@@ -398,11 +410,12 @@ class Glm5NextDecoderLayer(nn.Module):
             assert config.kv_lora_rank is not None
             # MLA projections are BF16 in the NVFP4 checkpoint. Mixed-precision
             # ModelOpt checkpoints list the ones they quantize (unlisted ones
-            # stay BF16); the MTP layer's are dequantized at load (mtp.py).
+            # stay BF16); the MTP layer's are dequantized at load (mtp.py),
+            # unless mtp_keeps_quantized_linears().
             mla_quant_config = (
                 quant_config
                 if isinstance(quant_config, ModelOptMixedPrecisionConfig)
-                and not is_mtp_layer
+                and (not is_mtp_layer or mtp_keeps_quantized_linears())
                 else None
             )
             self.self_attn = Glm5NextMLAAttention(
