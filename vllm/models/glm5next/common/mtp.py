@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
@@ -36,6 +39,7 @@ from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from . import mtp_cpu_moe
 from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
@@ -50,6 +54,39 @@ from .model import (
 logger = init_logger(__name__)
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _alias_mtp_expert_quantization(quant_config, config) -> None:
+    """Experiment (KH2): with the MTP layer's routed experts on the GPU
+    (``VLLM_EXP_MTP_CPU_MOE=0``), serve a mixed-precision ModelOpt
+    checkpoint's quantized MTP experts (Local Inference Lab's ``qad2``
+    branches: W4A16 NVFP4, 3.8 GiB) in that format instead of BF16 (13.5 GiB).
+    Such checkpoints list them under the multimodal name
+    (``model.language_model.layers.N.mlp.experts``); the MTP model builds
+    ``model.layers.N.mlp.experts``. Only the routed experts get an alias: the
+    layer's other quantized weights are dequantized at load, as before."""
+    if mtp_cpu_moe.enabled() or not isinstance(
+        quant_config, ModelOptMixedPrecisionConfig
+    ):
+        return
+    layers = quant_config.quantized_layers
+    if not layers:
+        return
+    first = config.num_hidden_layers
+    for n in range(first, first + (config.num_nextn_predict_layers or 0)):
+        target = f"model.layers.{n}.mlp.experts"
+        for source in (
+            f"model.language_model.layers.{n}.mlp.experts",
+            f"language_model.model.layers.{n}.mlp.experts",
+        ):
+            if source in layers and target not in layers:
+                layers[target] = layers[source]
+                logger.info(
+                    "MTP layer %d: routed experts on the GPU in %s (from %s)",
+                    n,
+                    layers[source].get("quant_algo"),
+                    source,
+                )
 
 
 def _dequant_nvfp4(
@@ -392,6 +429,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
         self.quant_config = vllm_config.quant_config
+        _alias_mtp_expert_quantization(self.quant_config, self.config)
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -460,6 +498,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         which = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[proj]
         moe.load_expert_weight(int(expert), which, loaded_weight)
         return True
+
+    def _keeps_quantized_experts(self, spec_layer: int, name: str) -> bool:
+        """A routed-expert tensor of an MTP layer whose experts run on the GPU
+        in a quantized format (``_alias_mtp_expert_quantization``): loaded as
+        stored rather than dequantized to BF16."""
+        if ".mlp.experts." not in name:
+            return False
+        cache = self.__dict__.setdefault("_quantized_experts", {})
+        if spec_layer not in cache:
+            # FusedMoEFactory wraps the module that holds the weights, so look
+            # them up by name (a CPU-MoE layer has none).
+            moe = self.model.layers[str(spec_layer)].mtp_block.mlp
+            w13 = next(
+                (p for n, p in moe.named_parameters() if n.endswith("w13_weight")),
+                None,
+            )
+            cache[spec_layer] = w13 is not None and not w13.dtype.is_floating_point
+        return cache[spec_layer]
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         spec_layer_weight_names = [
@@ -546,11 +602,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(name)
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
-            dequantized = dequantizer.add(name, loaded_weight)
-            if dequantized is True:
-                continue
-            if dequantized is not False:
-                name, loaded_weight = dequantized
+            if not self._keeps_quantized_experts(spec_layer, name):
+                dequantized = dequantizer.add(name, loaded_weight)
+                if dequantized is True:
+                    continue
+                if dequantized is not False:
+                    name, loaded_weight = dequantized
             if self._load_cpu_moe_expert(spec_layer, name, loaded_weight):
                 loaded_params.add(name)
                 continue
