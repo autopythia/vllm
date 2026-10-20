@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -11,7 +13,10 @@ from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.model_executor.layers.indexer_topk import (
+    SparseIndexerTopk,
+    get_indexer_topk,
+)
 from vllm.model_executor.layers.sparse_attn_indexer import (
     PrefillRowShard,
     _merge_dcp_topk_global,
@@ -163,6 +168,244 @@ def _fill_outside_rows_kernel(
     for c0 in range(end, n, BLOCK):
         cols = c0 + offs
         tl.store(base + cols, float("-inf"), mask=cols < n)
+
+
+def _fast_deterministic_topk() -> bool:
+    """Experiment (A7): with ``VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK=1``,
+    ``VLLM_EXP_INDEXER_FAST_DET_TOPK=1`` keeps the fast radix top-k kernels
+    and makes their result deterministic afterwards
+    (``_deterministic_topk_compact_``) instead of selecting with torch.topk:
+    the deterministic top-k cost K3 4-8% of its decode speed (e118, KH6)."""
+    return os.environ.get("VLLM_EXP_INDEXER_FAST_DET_TOPK", "0") == "1"
+
+
+_DET_TOPK_CHUNK = 4096  # columns per program in the multi-chunk kernels
+_DET_TOPK_BLOCK = 1024
+
+
+@triton.jit
+def _det_topk_threshold(
+    logits_row, sel_row, start, end, k, RELATIVE: tl.constexpr, KP2: tl.constexpr
+):
+    """The smallest logit among a row's selection (+inf if it is empty)."""
+    kk = tl.arange(0, KP2)
+    sel = tl.load(sel_row + kk, mask=kk < k, other=-1).to(tl.int64)
+    col = sel + start if RELATIVE else sel
+    valid = (kk < k) & (sel >= 0) & (col >= start) & (col < end)
+    vals = tl.load(logits_row + col, mask=valid, other=float("inf"))
+    return tl.min(vals, axis=0)
+
+
+@triton.jit
+def _det_topk_masks(x, m, t, DROP_NEG_INF: tl.constexpr):
+    gt = m & (x > t)
+    eq = m & (x == t)
+    if DROP_NEG_INF:
+        gt = gt & (x != float("-inf"))
+        eq = eq & (x != float("-inf"))
+    return gt, eq
+
+
+@triton.jit
+def _det_topk_emit(
+    x, m, cols, start, t, out_row, k, n_valid, n_ties, sel_before, eq_before,
+    RELATIVE: tl.constexpr, DROP_NEG_INF: tl.constexpr,
+):
+    """Write one block's selected columns at their final positions: the row's
+    selection is every column above the threshold plus its first ``n_ties``
+    tied columns, stored in descending column order (what ``_maybe_sort_topk_``
+    makes), so position = n_valid - 1 - ascending rank. Returns the updated
+    counts of selected and of tied columns before the next block."""
+    gt, eq = _det_topk_masks(x, m, t, DROP_NEG_INF)
+    tie_idx = eq_before + tl.cumsum(eq.to(tl.int32), axis=0) - 1
+    take = gt | (eq & (tie_idx < n_ties))
+    rank = sel_before + tl.cumsum(take.to(tl.int32), axis=0) - 1
+    pos = n_valid - 1 - rank
+    val = (cols - start) if RELATIVE else cols
+    tl.store(out_row + pos, val.to(tl.int32), mask=take & (pos >= 0) & (pos < k))
+    return (sel_before + tl.sum(take.to(tl.int32), axis=0),
+            eq_before + tl.sum(eq.to(tl.int32), axis=0))
+
+
+@triton.jit(do_not_specialize=["stride", "k"])
+def _det_topk_fused_kernel(
+    logits_ptr, stride, starts_ptr, ends_ptr, topk_ptr, k,
+    HAS_STARTS: tl.constexpr, RELATIVE: tl.constexpr, DROP_NEG_INF: tl.constexpr,
+    KP2: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Rows of at most CHUNK columns, one program per row: threshold, counts,
+    then the final order, in place (the selection is read before any write)."""
+    row = tl.program_id(0).to(tl.int64)
+    if HAS_STARTS:
+        start = tl.load(starts_ptr + row).to(tl.int64)
+    else:
+        start = tl.zeros((), dtype=tl.int64)
+    end = tl.maximum(tl.load(ends_ptr + row).to(tl.int64), start)
+    base = logits_ptr + row * stride
+    out = topk_ptr + row * k
+    t = _det_topk_threshold(base, out, start, end, k, RELATIVE, KP2)
+    offs = tl.arange(0, BLOCK)
+    n_gt = tl.zeros((), dtype=tl.int32)
+    n_eq = tl.zeros((), dtype=tl.int32)
+    for b in tl.static_range(0, CHUNK, BLOCK):
+        cols = start + b + offs
+        m = cols < end
+        x = tl.load(base + cols, mask=m, other=float("-inf"))
+        gt, eq = _det_topk_masks(x, m, t, DROP_NEG_INF)
+        n_gt += tl.sum(gt.to(tl.int32), axis=0)
+        n_eq += tl.sum(eq.to(tl.int32), axis=0)
+    n_ties = tl.maximum(tl.minimum(n_eq, k - n_gt), 0)
+    n_valid = tl.minimum(n_gt + n_ties, k)
+    sel_before = tl.zeros((), dtype=tl.int32)
+    eq_before = tl.zeros((), dtype=tl.int32)
+    for b in tl.static_range(0, CHUNK, BLOCK):
+        cols = start + b + offs
+        m = cols < end
+        x = tl.load(base + cols, mask=m, other=float("-inf"))
+        sel_before, eq_before = _det_topk_emit(
+            x, m, cols, start, t, out, k, n_valid, n_ties, sel_before, eq_before,
+            RELATIVE, DROP_NEG_INF,
+        )
+    for i in range(0, k, BLOCK):
+        idx = i + offs
+        tl.store(out + idx, -1, mask=(idx < k) & (idx >= n_valid))
+
+
+@triton.jit(do_not_specialize=["stride", "k", "n_chunks"])
+def _det_topk_count_kernel(
+    logits_ptr, stride, starts_ptr, ends_ptr, topk_ptr, t_ptr, cnt_ptr, k, n_chunks,
+    HAS_STARTS: tl.constexpr, RELATIVE: tl.constexpr, DROP_NEG_INF: tl.constexpr,
+    KP2: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Long rows, per (row, chunk): the threshold (every program computes it
+    from the selection; chunk 0 stores it) and the chunk's counts of columns
+    above and equal to it. Integer counts, no atomics."""
+    row = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1).to(tl.int64)
+    if HAS_STARTS:
+        start = tl.load(starts_ptr + row).to(tl.int64)
+    else:
+        start = tl.zeros((), dtype=tl.int64)
+    end = tl.maximum(tl.load(ends_ptr + row).to(tl.int64), start)
+    base = logits_ptr + row * stride
+    t = _det_topk_threshold(base, topk_ptr + row * k, start, end, k, RELATIVE, KP2)
+    if c == 0:
+        tl.store(t_ptr + row, t)
+    offs = tl.arange(0, BLOCK)
+    n_gt = tl.zeros((), dtype=tl.int32)
+    n_eq = tl.zeros((), dtype=tl.int32)
+    c0 = start + c * CHUNK
+    if c0 < end:
+        for b in tl.static_range(0, CHUNK, BLOCK):
+            cols = c0 + b + offs
+            m = cols < end
+            x = tl.load(base + cols, mask=m, other=float("-inf"))
+            gt, eq = _det_topk_masks(x, m, t, DROP_NEG_INF)
+            n_gt += tl.sum(gt.to(tl.int32), axis=0)
+            n_eq += tl.sum(eq.to(tl.int32), axis=0)
+    tl.store(cnt_ptr + (row * n_chunks + c) * 2, n_gt)
+    tl.store(cnt_ptr + (row * n_chunks + c) * 2 + 1, n_eq)
+
+
+@triton.jit(do_not_specialize=["stride", "k", "n_chunks"])
+def _det_topk_write_kernel(
+    logits_ptr, stride, starts_ptr, ends_ptr, topk_ptr, t_ptr, cnt_ptr, k, n_chunks,
+    HAS_STARTS: tl.constexpr, RELATIVE: tl.constexpr, DROP_NEG_INF: tl.constexpr,
+    NCP2: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Long rows, per (row, chunk): the chunk's selected columns at their final
+    positions (offsets from the counts of the chunks before it), in place: the
+    count kernel, launched before, has read the selection. Chunk 0 pads."""
+    row = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1)
+    if HAS_STARTS:
+        start = tl.load(starts_ptr + row).to(tl.int64)
+    else:
+        start = tl.zeros((), dtype=tl.int64)
+    end = tl.maximum(tl.load(ends_ptr + row).to(tl.int64), start)
+    t = tl.load(t_ptr + row)
+    jj = tl.arange(0, NCP2)
+    cm = jj < n_chunks
+    cnt = cnt_ptr + row * n_chunks * 2
+    gts = tl.load(cnt + jj * 2, mask=cm, other=0)
+    eqs = tl.load(cnt + jj * 2 + 1, mask=cm, other=0)
+    tot_gt = tl.sum(gts, axis=0)
+    n_ties = tl.maximum(tl.minimum(tl.sum(eqs, axis=0), k - tot_gt), 0)
+    n_valid = tl.minimum(tot_gt + n_ties, k)
+    gt_before = tl.sum(tl.where(jj < c, gts, 0), axis=0)
+    eq_before = tl.sum(tl.where(jj < c, eqs, 0), axis=0)
+    sel_before = gt_before + tl.minimum(eq_before, n_ties)
+    out = topk_ptr + row * k
+    base = logits_ptr + row * stride
+    offs = tl.arange(0, BLOCK)
+    c0 = start + c.to(tl.int64) * CHUNK
+    if c0 < end:
+        for b in tl.static_range(0, CHUNK, BLOCK):
+            cols = c0 + b + offs
+            m = cols < end
+            x = tl.load(base + cols, mask=m, other=float("-inf"))
+            sel_before, eq_before = _det_topk_emit(
+                x, m, cols, start, t, out, k, n_valid, n_ties, sel_before, eq_before,
+                RELATIVE, DROP_NEG_INF,
+            )
+    if c == 0:
+        for i in range(0, k, BLOCK):
+            idx = i + offs
+            tl.store(out + idx, -1, mask=(idx < k) & (idx >= n_valid))
+
+
+def _deterministic_topk_compact_(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    topk: torch.Tensor,
+    *,
+    relative: bool,
+    drop_neg_inf: bool,
+    max_len: int | None = None,
+) -> None:
+    """Make a fast top-k kernel's result ``topk`` ([rows, k] int32, any order,
+    -1 padding) deterministic, in place: every column above the k-th value plus
+    the lowest tied columns, in descending column order with -1 last, i.e.
+    already as ``_maybe_sort_topk_`` leaves it. ``relative``: the indices count
+    from each row's start (prefill); ``drop_neg_inf``: -inf logits are padding
+    (prefill's reference, ``_deterministic_topk_prefill_``). ``max_len`` bounds
+    the rows' lengths in columns (host side; default the logits' width): rows of
+    up to 4,096 columns take one launch, longer ones two."""
+    rows, k = topk.shape
+    if rows == 0 or k == 0:
+        return
+    assert logits.stride(1) == 1
+    width = logits.shape[1]
+    span = width if max_len is None else max(1, min(width, int(max_len)))
+    n_chunks = triton.cdiv(span, _DET_TOPK_CHUNK)
+    out = topk if topk.is_contiguous() else topk.contiguous()
+    starts = row_starts if row_starts is not None else row_ends
+    flags = dict(
+        HAS_STARTS=row_starts is not None,
+        RELATIVE=relative,
+        DROP_NEG_INF=drop_neg_inf,
+        CHUNK=_DET_TOPK_CHUNK,
+        BLOCK=_DET_TOPK_BLOCK,
+    )
+    if n_chunks == 1:
+        _det_topk_fused_kernel[(rows,)](
+            logits, logits.stride(0), starts, row_ends, out, k,
+            KP2=triton.next_power_of_2(k), **flags,
+        )
+    else:
+        t = torch.empty(rows, dtype=torch.float32, device=logits.device)
+        cnt = torch.empty(rows, n_chunks, 2, dtype=torch.int32, device=logits.device)
+        _det_topk_count_kernel[(rows, n_chunks)](
+            logits, logits.stride(0), starts, row_ends, out, t, cnt, k, n_chunks,
+            KP2=triton.next_power_of_2(k), **flags,
+        )
+        _det_topk_write_kernel[(rows, n_chunks)](
+            logits, logits.stride(0), starts, row_ends, out, t, cnt, k, n_chunks,
+            NCP2=triton.next_power_of_2(n_chunks), **flags,
+        )
+    if out is not topk:
+        topk.copy_(out)
 
 
 @eager_break_during_capture
@@ -439,9 +682,13 @@ def sparse_attn_indexer_kpool(
             else:
                 topk_dst = topk_indices_buffer[row_start:row_end, :topk_tokens]
 
+            compacted = False
             if logits.shape[1] == 0:
                 topk_dst.fill_(-1)
-            elif envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK:
+            elif (
+                envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK
+                and not _fast_deterministic_topk()
+            ):
                 _deterministic_topk_prefill_(
                     logits, cu_seqlen_ks, cu_seqlen_ke, topk_dst
                 )
@@ -456,6 +703,16 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+                if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK:
+                    _deterministic_topk_compact_(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_dst,
+                        relative=True,
+                        drop_neg_inf=True,
+                    )
+                    compacted = True
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,
@@ -466,7 +723,8 @@ def sparse_attn_indexer_kpool(
                 pool_cp_interleave,
                 row_starts=cu_seqlen_ks,
             )
-            _maybe_sort_topk_(topk_dst)
+            if not (compacted and dcp_world_size <= 1):  # else already in this order
+                _maybe_sort_topk_(topk_dst)
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -696,8 +954,13 @@ def sparse_attn_indexer_kpool(
         # honors kernel_config.sparse_indexer_topk_backend and picks between
         # cooperative/persistent by batch size instead of always taking the
         # same kernel.
+        fast_det = (
+            envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK and _fast_deterministic_topk()
+        )
         get_indexer_topk(
-            "torch" if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK else topk_backend
+            "torch"
+            if envs.VLLM_SPARSE_INDEXER_DETERMINISTIC_TOPK and not fast_det
+            else topk_backend
         )(
             logits,
             seq_lens,
@@ -706,6 +969,16 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
+        if fast_det:
+            _deterministic_topk_compact_(
+                logits,
+                None,
+                SparseIndexerTopk._row_ends(seq_lens, next_n, logits.shape[0]),
+                topk_dst,
+                relative=False,
+                drop_neg_inf=False,
+                max_len=attn_metadata_narrowed.max_seq_len,
+            )
         _merge_dcp_topk_global(
             logits,
             topk_dst,
@@ -714,7 +987,8 @@ def sparse_attn_indexer_kpool(
             dcp_world_size,
             pool_cp_interleave,
         )
-        _maybe_sort_topk_(topk_dst)
+        if not (fast_det and dcp_world_size <= 1):  # else already in this order
+            _maybe_sort_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
