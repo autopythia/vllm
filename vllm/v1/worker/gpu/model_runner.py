@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -306,8 +307,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
 
-        # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        # Draft tokens propagation - for spec-dec + struct outputs. Under
+        # pipeline parallelism with async scheduling, keep the drafts of as many
+        # steps as can be in flight (see DraftTokensHandler).
+        keep_draft_steps = 1
+        if (
+            self.use_pp
+            and self.scheduler_config.async_scheduling
+            and os.environ.get("VLLM_EXP_PP_DRAFT_HISTORY", "1") != "0"
+        ):
+            keep_draft_steps = vllm_config.max_concurrent_batches
+            if self.speculative_config is not None:
+                logger.info(
+                    "Spec decode with structured outputs: the drafts of the last "
+                    "%d steps are kept for the scheduler's grammar checks "
+                    "(VLLM_EXP_PP_DRAFT_HISTORY=0 keeps only the last step's).",
+                    keep_draft_steps,
+                )
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device, keep_steps=keep_draft_steps
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 

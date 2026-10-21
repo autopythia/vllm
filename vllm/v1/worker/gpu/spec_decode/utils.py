@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import deque
+
 import numpy as np
 import torch
 
@@ -46,7 +48,7 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
 
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    def __init__(self, device: torch.device | None = None, keep_steps: int = 1):
         self.device = device
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
@@ -55,6 +57,16 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # Pipeline parallelism with async scheduling interleaves the steps of
+        # several decode groups. The engine takes a deferred batch's drafts for
+        # grammar validation after the other groups' steps may have replaced
+        # them here, so with keep_steps > 1 the drafts of the last keep_steps
+        # steps are returned, the newest for each request. With only the last
+        # step's, the batch's structured-output requests keep their -1
+        # placeholders and all of their drafts are rejected.
+        self._history: deque[tuple[list[str], np.ndarray | None, int]] = deque(
+            maxlen=max(keep_steps, 1)
+        )
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -65,6 +77,7 @@ class DraftTokensHandler:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None
+            self._remember()
             return
 
         # For spec decoding + structured outputs, we must transfer the
@@ -78,8 +91,31 @@ class DraftTokensHandler:
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
+        self._remember()
+
+    def _remember(self) -> None:
+        if self._history.maxlen > 1:
+            self._history.append(
+                (list(self.req_ids), self.draft_tokens_np, self.num_draft_tokens)
+            )
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
+        if self._history.maxlen > 1:
+            # Every copy runs on copy_stream, so the last recorded event
+            # covers the copies of the earlier steps too.
+            synced = False
+            drafts: dict[str, list[int]] = {}
+            for req_ids, draft_tokens_np, num_draft_tokens in self._history:
+                if draft_tokens_np is None:
+                    rows = [[-1] * num_draft_tokens for _ in req_ids]
+                else:
+                    if not synced:
+                        self.copy_event.synchronize()
+                        synced = True
+                    rows = draft_tokens_np.tolist()
+                # Oldest step first: a request's newer drafts replace its older.
+                drafts.update(zip(req_ids, rows))
+            return DraftTokenIds(list(drafts), list(drafts.values()))
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
