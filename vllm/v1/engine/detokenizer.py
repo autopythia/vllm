@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from abc import ABC, abstractmethod
 from bisect import bisect_left
@@ -18,6 +19,24 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
+
+
+def _decode_stream_prefill(prompt_token_ids: list[int] | None) -> list[int] | None:
+    """Experiment (VLLM_EXP_DETOK_PREFILL_TOKENS=N): prime the decode stream
+    with the prompt's last N tokens instead of all of them. The stream only
+    needs them to place the first output token's text (spacing, a character
+    split across tokens), but tokenizers decodes the whole prefill at the
+    first step: ~0.22 s for a 634K-token prompt, before its first token."""
+    n = int(os.environ.get("VLLM_EXP_DETOK_PREFILL_TOKENS") or 0)
+    if n <= 0 or prompt_token_ids is None or len(prompt_token_ids) <= n:
+        return prompt_token_ids
+    logger.info_once(
+        "The detokenizer is primed with the prompt's last %d tokens "
+        "(VLLM_EXP_DETOK_PREFILL_TOKENS)",
+        n,
+    )
+    return prompt_token_ids[-n:]
+
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
@@ -193,7 +212,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=_decode_stream_prefill(request.prompt_token_ids),
             skip_special_tokens=self.skip_special_tokens,
         )
 
