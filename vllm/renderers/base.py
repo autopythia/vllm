@@ -635,6 +635,13 @@ class BaseRenderer(ABC, Generic[_T]):
         kwargs = params.get_encode_kwargs()
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
+        else:
+            # VLLM_EXP_SEGMENTED_TOKENIZE=1: long prompts in segments (the same ids)
+            from vllm.renderers.segmented_tokenize import segmented_encode
+
+            ids = segmented_encode(tokenizer, prompt["prompt"], kwargs)
+            if ids is not None:
+                return self._build_tokens_prompt(ids, prompt)
         encoding = tokenizer(prompt["prompt"], **kwargs)
         return self._build_tokens_prompt(
             encoding["input_ids"],
