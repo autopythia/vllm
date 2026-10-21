@@ -32,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.glm5next.nvidia.ops import indexer_fewer_copies
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -335,6 +336,7 @@ class Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
         self._ll_bf16_max_m = _indexer_ll_bf16_max_m()
+        self._fewer_copies = indexer_fewer_copies.enabled()
         if self._ll_bf16_max_m:
             # (K, N) for vLLM's ll_bf16 warmup (kernel_warmup.py), which
             # compiles its kernels before CUDA-graph capture.
@@ -430,7 +432,9 @@ class Indexer(nn.Module):
             # changing k. Rounded, k equals the BF16 GEMM's output (both are
             # correctly rounded: FP32 sums of exact products).
             k = _fused_indexer_k_norm(
-                kw32[:, : self.head_dim].to(torch.bfloat16),
+                indexer_fewer_copies.cast_bf16_rows(kw32[:, : self.head_dim])
+                if self._fewer_copies
+                else kw32[:, : self.head_dim].to(torch.bfloat16),
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.head_dim,

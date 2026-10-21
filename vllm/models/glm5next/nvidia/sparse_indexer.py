@@ -33,6 +33,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
     _scatter_decode_tokens_by_request,
     kv_cache_as_quant_view,
 )
+from vllm.models.glm5next.nvidia.ops import indexer_fewer_copies
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -568,7 +569,22 @@ def sparse_attn_indexer_kpool(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # VLLM_EXP_INDEXER_FEWER_COPIES=1: a pure decode batch on the pool path
+    # writes its top-k rows, their padding and the rows after them in one
+    # kernel (indexer_fewer_copies.expand_pools_into), so no fill here
+    fewer_copies = (
+        has_decode
+        and not has_prefill
+        and index_kpool > 1
+        and positions is not None
+        and dcp_world_size <= 1
+        and indexer_fewer_copies.enabled()
+        and not attn_metadata_narrowed.decode.requires_padding
+        and attn_metadata_narrowed.max_seq_len > topk_tokens
+        and topk_indices_buffer.shape[1] >= topk_tokens + index_kpool - 1
+    )
+    if not fewer_copies:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -828,7 +844,13 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                # with fewer_copies the int64 positions as they are (the
+                # kernel uses them only in integer arithmetic)
+                dec_pos = (
+                    positions[:num_decode_tokens]
+                    if fewer_copies
+                    else positions[:num_decode_tokens].to(torch.int32)
+                ).view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -1007,6 +1029,15 @@ def sparse_attn_indexer_kpool(
             _maybe_sort_topk_(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
+        if fewer_copies:
+            indexer_fewer_copies.expand_pools_into(
+                pool_topk,
+                positions,
+                topk_indices_buffer,
+                min(hidden_states.shape[0], topk_indices_buffer.shape[0]),
+                index_kpool,
+            )
+            return topk_indices_buffer
         if index_kpool > 1:
             pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]
