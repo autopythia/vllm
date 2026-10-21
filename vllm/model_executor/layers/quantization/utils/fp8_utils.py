@@ -822,15 +822,26 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     else:
         x_q_local = torch.empty_like(x_contiguous, device=x.device, dtype=dtype)
 
-    torch.ops._C.per_token_group_fp8_quant_packed(
-        x_contiguous,
-        x_q_local,
-        x_s_packed,
-        group_size,
-        eps,
-        fp8_min,
-        fp8_max,
+    from vllm.model_executor.layers.quantization.utils import (
+        fp8_quant_packed_small_m as small_m,
     )
+
+    if small_m.usable(x_contiguous, group_size, out_q) and dtype == torch.float8_e4m3fn:
+        # Experiment (KH15, VLLM_EXP_FP8_QUANT_TRITON=1): the same bytes from a
+        # Triton kernel for decode's few rows.
+        small_m.quant_into(
+            x_contiguous, x_q_local, x_s_packed, group_size, eps, fp8_min, fp8_max
+        )
+    else:
+        torch.ops._C.per_token_group_fp8_quant_packed(
+            x_contiguous,
+            x_q_local,
+            x_s_packed,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+        )
 
     # return a tensor with the original logical shape.
     x_q = x_q_local.view_as(x)
