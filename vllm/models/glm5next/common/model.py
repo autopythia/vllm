@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import ClassVar, Literal
 
 import torch
@@ -1116,6 +1116,75 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return loaded_params
 
 
+def _draft_vocab_head_order(
+    config, lm_head: nn.Module
+) -> tuple[torch.Tensor, int] | None:
+    """Experiment (VLLM_EXP_MTP_DRAFT_VOCAB=FILE with
+    VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE=1 and VLLM_EXP_MTP_FP8_HEAD=1, which
+    builds the drafter's head): the LM head's row order with the
+    draft vocabulary's ids first (ascending), then the other ids. The rows
+    are stored in this order, so the MTP drafter reads the vocabulary as the
+    head's first rows (no copy); compute_logits restores the token order.
+    Only for an MXFP8 head (E4M3 rows with per-32 scales) on one rank."""
+    vocab_file = os.environ.get("VLLM_EXP_MTP_DRAFT_VOCAB")
+    if not vocab_file or os.environ.get("VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE") != "1":
+        return None
+    weight = getattr(lm_head, "weight", None)
+    vocab = config.vocab_size
+    reason = None
+    if os.environ.get("VLLM_EXP_MTP_FP8_HEAD") != "1":
+        # the drafter learns the row order where it builds its head
+        reason = "VLLM_EXP_MTP_FP8_HEAD=1 is not set"
+    elif getattr(config, "tie_word_embeddings", False):
+        reason = "the LM head is tied to the embeddings"
+    elif getattr(lm_head, "tp_size", 1) > 1:
+        reason = "the LM head is split"
+    elif weight is None or weight.dtype != torch.float8_e4m3fn:
+        reason = "the LM head is not MXFP8"
+    elif getattr(lm_head, "weight_scale", None) is None or weight.shape[0] != vocab:
+        reason = "the LM head has no per-32 scales or padded rows"
+    if reason is not None:
+        logger.info("LM head rows not reordered for the draft vocabulary: %s", reason)
+        return None
+    import numpy as np
+
+    ids = torch.from_numpy(np.load(vocab_file).astype(np.int64)).unique()
+    ids = ids[(ids >= 0) & (ids < vocab)]
+    # on the host: vLLM builds the model under a CUDA default device
+    rest = torch.ones(vocab, dtype=torch.bool, device="cpu")
+    rest[ids] = False
+    order = torch.cat([ids, torch.arange(vocab, device="cpu")[rest]])
+    return order, ids.numel()
+
+
+def _reorder_head_rows(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    lm_head: nn.Module,
+    order: torch.Tensor,
+    n: int,
+    on_both_loaded: Callable[[], None],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Store the LM head's rows (E4M3 weights and E8M0 scales) in ``order``
+    as they are loaded (on the host: no GPU temporary). Keeps the first n
+    rows' scales unswizzled for the drafter's GEMV. The loader may call
+    load_weights several times (once per run of this model's tensors), so
+    the head's two tensors are counted on the head itself."""
+    for name, tensor in weights:
+        if (
+            name in ("lm_head.weight", "lm_head.weight_scale")
+            and tensor.dim() == 2
+            and tensor.shape[0] == order.numel()
+        ):
+            tensor = tensor.index_select(0, order.to(tensor.device))
+            if name == "lm_head.weight_scale":
+                lm_head.exp_draft_scales = tensor[:n].clone()
+            seen = lm_head.__dict__.setdefault("exp_draft_rows_seen", set())
+            seen.add(name)
+            if len(seen) == 2:
+                on_both_loaded()
+        yield name, tensor
+
+
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
@@ -1144,6 +1213,13 @@ class Glm5NextForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        # VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE (experiment): the head's rows are
+        # stored with the draft vocabulary first; logits are put back in
+        # token order with the inverse permutation (built after loading).
+        self._head_order: tuple[torch.Tensor, int] | None = None
+        self._head_inverse: torch.Tensor | None = None
+        if get_pp_group().is_last_rank:
+            self._head_order = _draft_vocab_head_order(self.config, self.lm_head)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1205,9 +1281,41 @@ class Glm5NextForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and self._head_order is not None:
+            if self._head_inverse is None:
+                raise RuntimeError(
+                    "VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE: the LM head's weight and "
+                    "scales were not both reordered while loading"
+                )
+            # rows stored in draft-vocabulary order: back to token order
+            logits = logits.index_select(-1, self._head_inverse)
         return logits
 
+    def _head_rows_reordered(self) -> None:
+        """Both head tensors are stored in draft-vocabulary order: the inverse
+        order for compute_logits, and the order for the MTP drafter, which
+        shares this head."""
+        assert self._head_order is not None
+        order, n = self._head_order
+        dev = self.lm_head.weight.device
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel(), device=order.device)
+        self._head_inverse = inverse.to(dev)
+        self.lm_head.exp_draft_order = order.to(dev)
+        self.lm_head.exp_draft_inverse = self._head_inverse
+        self.lm_head.exp_draft_rows = n
+        logger.info(
+            "LM head rows stored with the %d draft-vocabulary tokens first "
+            "(VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE); logits are reordered back",
+            n,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._head_order is not None:
+            order, n = self._head_order
+            weights = _reorder_head_rows(
+                weights, self.lm_head, order, n, self._head_rows_reordered
+            )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

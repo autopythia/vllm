@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -369,12 +370,25 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self._fp8_heads: list | None = None
+        # VLLM_EXP_MTP_DRAFT_VOCAB (experiment): drafts from a subset of the
+        # vocabulary, (FP8 head over its rows, the rows' token ids)
+        self._draft_vocab: tuple | None = None
+        self._model_dir = vllm_config.model_config.model
+        # VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE: the shared head's rows are stored
+        # in draft-vocabulary order (model.py); token ids of its rows, and
+        # the inverse order for full-head logits
+        self._head_order: torch.Tensor | None = None
+        self._head_inverse: torch.Tensor | None = None
 
     def build_fp8_head(self) -> None:
         """Experiment (VLLM_EXP_MTP_FP8_HEAD=1): draft logits from a row-scaled FP8 copy of the shared LM head
         (mtp_fp8_head.py), half the bytes of the BF16 head per draft. Call after the head is shared."""
         from .mtp_fp8_head import Fp8Head
 
+        vocab_file = os.environ.get("VLLM_EXP_MTP_DRAFT_VOCAB")
+        if vocab_file:
+            self._build_draft_vocab(vocab_file)
+            return
         copies: dict[int, Fp8Head] = {}
         self._fp8_heads = []
         for layer in self._mtp_layers:
@@ -392,9 +406,83 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 copies[id(head)] = Fp8Head(head.weight)
             self._fp8_heads.append(copies[id(head)])
 
+    def _build_draft_vocab(self, vocab_file: str) -> None:
+        """Experiment (VLLM_EXP_MTP_DRAFT_VOCAB=FILE, a .npy of token ids, with
+        VLLM_EXP_MTP_FP8_HEAD=1): the drafter's LM head over those rows only,
+        a row-scaled FP8 copy read from the checkpoint (MXFP8 dequantized),
+        so a draft reads a fraction of the head. Drafts outside the subset
+        are impossible; the target verifies every draft as before."""
+        import numpy as np
+
+        from .mtp_fp8_head import (
+            Fp8Head,
+            Mxfp8Head,
+            load_draft_vocab_mxfp8,
+            load_draft_vocab_rows,
+        )
+
+        head = self._mtp_layers[0].shared_head.head
+        if head.tp_size > 1:
+            logger.info("MTP draft vocabulary not used: the LM head is split")
+            return
+        vocab = self.logits_processor.org_vocab_size
+        order = getattr(head, "exp_draft_order", None)
+        if order is not None:
+            # memory-free: the vocabulary is the head's first rows (a view);
+            # only their per-32 scales are copied, unswizzled
+            n = head.exp_draft_rows
+            scales = head.exp_draft_scales.to(head.weight.device)
+            del head.exp_draft_scales
+            sub = Mxfp8Head(head.weight[:n], scales)
+            self._draft_vocab = (sub, order[:n])
+            self._head_order = order
+            self._head_inverse = head.exp_draft_inverse
+            logger.info(
+                "MTP drafts from %d of %d tokens (VLLM_EXP_MTP_DRAFT_VOCAB=%s): "
+                "the LM head's first rows (VLLM_EXP_MTP_DRAFT_VOCAB_INPLACE), "
+                "%.1f MiB of scales copied",
+                n,
+                vocab,
+                vocab_file,
+                scales.numel() / 2**20,
+            )
+            return
+        ids = torch.from_numpy(np.load(vocab_file).astype(np.int64)).unique()
+        ids = ids[(ids >= 0) & (ids < vocab)]
+        dev = head.weight.device
+        mx = None
+        if os.environ.get("VLLM_EXP_MTP_DRAFT_VOCAB_ROWFP8", "0") != "1":
+            mx = load_draft_vocab_mxfp8(self._model_dir, ids)
+        if mx is not None:  # the head's own MXFP8 rows: the target's weights
+            sub = Mxfp8Head(mx[0].to(dev), mx[1].to(dev))
+        else:  # a row-scaled FP8 copy
+            sub = Fp8Head(load_draft_vocab_rows(self._model_dir, ids))
+            sub.w8, sub.scale = sub.w8.to(dev), sub.scale.to(dev)
+        self._draft_vocab = (sub, ids.to(dev))
+        logger.info(
+            "MTP drafts from %d of %d tokens (VLLM_EXP_MTP_DRAFT_VOCAB=%s): "
+            "%.0f MiB %s on the GPU",
+            ids.numel(),
+            vocab,
+            vocab_file,
+            sub.w8.numel() / 2**20,
+            "MXFP8" if mx is not None else "FP8 (row scales)",
+        )
+
     def _fp8_logits(self, step_idx: int, hidden_states: torch.Tensor) -> torch.Tensor | None:
         from .mtp_fp8_head import MAX_ROWS
 
+        if self._draft_vocab is not None and 1 <= hidden_states.shape[0] <= MAX_ROWS:
+            sub, ids = self._draft_vocab
+            lp = self.logits_processor
+            part = sub(hidden_states)
+            if lp.soft_cap is not None:
+                part = torch.tanh(part / lp.soft_cap) * lp.soft_cap
+            if lp.scale != 1.0:
+                part = part * lp.scale
+            logits = part.new_full((part.shape[0], lp.org_vocab_size), float("-inf"))
+            logits[:, ids] = part
+            return logits
         if self._fp8_heads is None or not 1 <= hidden_states.shape[0] <= MAX_ROWS:
             return None
         if self._mtp_layers[step_idx].shared_head.head.tp_size > 1:
@@ -455,7 +543,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         logits = self._fp8_logits(current_step_idx, hidden_states)
         if logits is not None:
             return logits
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        if logits is not None and self._head_inverse is not None:
+            logits = logits.index_select(-1, self._head_inverse)
+        return logits
 
     def get_top_tokens(
         self,
@@ -470,12 +561,21 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
+        from .mtp_fp8_head import MAX_ROWS
+
+        if self._draft_vocab is not None and 1 <= hidden_states.shape[0] <= MAX_ROWS:
+            # the subset's ids ascend, so ties pick the lowest id as before
+            sub, ids = self._draft_vocab
+            return ids[sub(hidden_states).max(dim=-1).indices]
         logits = self._fp8_logits(current_step_idx, hidden_states)
         if logits is not None:
             return logits.max(dim=-1).indices
-        return self.logits_processor.get_top_tokens(
+        top = self.logits_processor.get_top_tokens(
             mtp_layer.shared_head.head, hidden_states
         )
+        if self._head_order is not None:
+            top = self._head_order[top]  # head row -> token id
+        return top
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
