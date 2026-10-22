@@ -20,11 +20,13 @@ class MTPSpeculator(TargetDependentARSpeculator):
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
-        if os.environ.get("VLLM_EXP_MTP_FP8_HEAD", "0") == "1" and hasattr(
-            draft_model.model, "build_fp8_head"
-        ):
-            # Experiment: draft logits from an FP8 copy of the shared LM head.
-            draft_model.model.build_fp8_head()
+        if os.environ.get("VLLM_EXP_MTP_FP8_HEAD", "0") == "1":
+            # Experiment: draft logits from an FP8 copy of the shared LM head
+            # (GLM-5.3 builds it in its inner model, Qwen3.5 in the outer one).
+            if hasattr(draft_model.model, "build_fp8_head"):
+                draft_model.model.build_fp8_head()
+            elif hasattr(draft_model, "build_fp8_head"):
+                draft_model.build_fp8_head()
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config

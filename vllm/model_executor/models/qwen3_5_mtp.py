@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -247,10 +248,105 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Experiment (VLLM_EXP_MTP_FP8_HEAD=1): an FP8 copy of the LM head for
+        # the draft logits, built by the MTP speculator once the head is shared;
+        # with VLLM_EXP_MTP_DRAFT_VOCAB=FILE a copy of those rows only.
+        self._fp8_head = None
+        self._draft_ids: torch.Tensor | None = None
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def build_fp8_head(self) -> None:
+        """Draft logits from a row-scaled FP8 copy of the (shared) LM head:
+        half the bytes per draft step. The target keeps its BF16 head, so the
+        verified tokens are the target's own; only the drafts can change."""
+        from vllm.model_executor.layers.fp8_draft_head import Fp8DraftHead
+
+        head = self.lm_head
+        weight = getattr(head, "weight", None)
+        if (
+            isinstance(head, PPMissingLayer)
+            or getattr(head, "tp_size", 1) > 1
+            or not isinstance(weight, torch.Tensor)
+            or weight.dtype != torch.bfloat16
+        ):
+            logger.info(
+                "MTP FP8 draft head not built: needs one BF16 LM head without "
+                "tensor parallelism (VLLM_EXP_MTP_FP8_HEAD)"
+            )
+            return
+        vocab_file = os.environ.get("VLLM_EXP_MTP_DRAFT_VOCAB")
+        ids = self._load_draft_vocab(vocab_file) if vocab_file else None
+        if ids is not None:
+            self._draft_ids = ids.to(weight.device)
+            self._fp8_head = Fp8DraftHead(weight[self._draft_ids])
+            logger.info(
+                "MTP drafts: logits from an FP8 copy of %d of the LM head's %d "
+                "rows (%s), %.0f MiB (VLLM_EXP_MTP_DRAFT_VOCAB)",
+                self._fp8_head.n,
+                self.logits_processor.org_vocab_size,
+                vocab_file,
+                self._fp8_head.nbytes / 2**20,
+            )
+            return
+        self._fp8_head = Fp8DraftHead(weight)
+        logger.info(
+            "MTP drafts: logits from an FP8 copy of the LM head, %d x %d, "
+            "%.0f MiB (VLLM_EXP_MTP_FP8_HEAD)",
+            self._fp8_head.n,
+            self._fp8_head.k,
+            self._fp8_head.nbytes / 2**20,
+        )
+
+    def _load_draft_vocab(self, path: str) -> torch.Tensor | None:
+        """The ids of a draft vocabulary (a NumPy .npy of ascending, unique
+        token ids below the vocabulary size), or None with a warning."""
+        import numpy as np
+
+        try:
+            ids = np.load(path)
+        except (OSError, ValueError) as e:
+            logger.warning("MTP draft vocabulary %s not read (%s): full head", path, e)
+            return None
+        vocab = self.logits_processor.org_vocab_size
+        if (
+            ids.ndim != 1
+            or ids.size == 0
+            or not np.issubdtype(ids.dtype, np.integer)
+            or ids.min() < 0
+            or ids.max() >= vocab
+            or (np.diff(ids) <= 0).any()
+        ):
+            logger.warning(
+                "MTP draft vocabulary %s: not ascending unique ids below %d: full head",
+                path,
+                vocab,
+            )
+            return None
+        return torch.from_numpy(ids.astype(np.int64))
+
+    def _fp8_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """The draft logits from the FP8 head, or None (not built, or more rows
+        than its GEMM takes: the BF16 head then)."""
+        from vllm.model_executor.layers.fp8_draft_head import MAX_ROWS
+
+        if self._fp8_head is None or not 1 <= hidden_states.shape[0] <= MAX_ROWS:
+            return None
+        lp = self.logits_processor
+        logits = self._fp8_head(hidden_states, lp.head_dtype or hidden_states.dtype)
+        if self._draft_ids is None:
+            logits = logits[..., : lp.org_vocab_size]
+        if lp.soft_cap is not None:
+            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+        if lp.scale != 1.0:
+            logits = logits * lp.scale
+        if self._draft_ids is not None:  # the rows outside the vocabulary: -inf
+            full = logits.new_full((logits.shape[0], lp.org_vocab_size), float("-inf"))
+            full[:, self._draft_ids] = logits
+            return full
+        return logits
 
     def embed_input_ids(
         self,
@@ -297,7 +393,21 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        logits = self._fp8_logits(hidden_states)
+        if logits is not None:
+            return logits
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.fp8_draft_head import MAX_ROWS
+
+        if self._draft_ids is not None and 1 <= hidden_states.shape[0] <= MAX_ROWS:
+            # the ids ascend, so ties pick the lowest id, as the full argmax
+            return self._draft_ids[self._fp8_head(hidden_states).argmax(dim=-1)]
+        logits = self._fp8_logits(hidden_states)
+        if logits is not None:
+            return logits.argmax(dim=-1)
+        return super().get_top_tokens(hidden_states)
 
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         return not name.startswith("mtp.") and not any(
