@@ -334,6 +334,12 @@ def _repack_marlin_experts(
             if in_place and nbytes == weight[0].numel() * weight.element_size():
                 out = weight.view(-1).view(marlin_qweight.dtype)
                 out = out.view(num_experts, *marlin_qweight.shape)
+                # once per process: the MTP layer's experts are on the last stage
+                logger.info_once(
+                    "Marlin NVFP4 MoE: experts repacked in place "
+                    "(VLLM_EXP_MARLIN_REPACK_IN_PLACE)",
+                    scope="process",
+                )
             else:
                 out = torch.empty(
                     (num_experts, *marlin_qweight.shape),

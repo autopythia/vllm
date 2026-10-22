@@ -13,7 +13,10 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
+
+logger = init_logger(__name__)
 
 MAX_ROWS = 16
 
@@ -88,6 +91,12 @@ def quant_into(
 ) -> None:
     """Fill ``x_q`` and ``x_s_packed`` as
     ``torch.ops._C.per_token_group_fp8_quant_packed`` does."""
+    # once per process, so that every pipeline stage that uses it says so
+    logger.info_once(
+        "FP8 block quantization: a Triton kernel for decode's few rows "
+        "(VLLM_EXP_FP8_QUANT_TRITON)",
+        scope="process",
+    )
     k = x_contiguous.shape[-1]
     mn = x_contiguous.numel() // k
     groups = k // group_size
