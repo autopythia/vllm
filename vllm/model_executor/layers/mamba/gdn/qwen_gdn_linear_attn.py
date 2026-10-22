@@ -450,6 +450,67 @@ class ChunkGatedDeltaRule(CustomOp):
         return o, final_state
 
 
+def _gdn_ba_ll_bf16_max_m(proj: nn.Module) -> int:
+    """Experiment (VLLM_EXP_GDN_BA_LL_BF16=1): rows up to which the GDN layer's
+    b and a projection (in_proj_ba: 2 x num_v_heads outputs, ~1 MB of BF16
+    weights for Qwen3.8-27B) runs as vLLM's cuteDSL ll_bf16_gemm instead of the
+    cuBLAS GEMM. For 2-4 rows cuBLAS picks an sm_80 WMMA kernel with a handful
+    of CTAs on sm_120: 17.7 us per layer (alone, CUDA graphs) against 2.9-3.1
+    for ll_bf16_gemm with the cast, 48 layers in Qwen3.8-27B; from 6 rows on
+    cuBLAS takes another kernel (2.5-2.8 us) and is the faster one. The FP32
+    sums are rounded to BF16, as the GEMM rounds its own. Rows up to
+    VLLM_EXP_GDN_BA_LL_BF16_MAX_M (default 4); more keep the GEMM. Only for a
+    BF16 projection without bias."""
+    if os.environ.get("VLLM_EXP_GDN_BA_LL_BF16", "0") != "1":
+        return 0
+    if not current_platform.is_cuda():
+        return 0
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import is_available
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    weight = getattr(proj, "weight", None)
+    if (
+        not is_available()
+        or not isinstance(getattr(proj, "quant_method", None), UnquantizedLinearMethod)
+        or getattr(proj, "bias", None) is not None
+        or not isinstance(weight, torch.Tensor)
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] % 8
+    ):
+        return 0
+    max_m = int(os.environ.get("VLLM_EXP_GDN_BA_LL_BF16_MAX_M", "4"))
+    return max(0, min(16, max_m))
+
+
+def qwen_gdn_ba_proj(x: torch.Tensor, weight: torch.Tensor, max_m: int) -> torch.Tensor:
+    """The product x @ weight.T in BF16: ll_bf16_gemm for 1 to max_m rows, else
+    the GEMM. A custom op, so that compilation and CUDA-graph capture keep the
+    runtime branch on the number of rows."""
+    if x.dtype == torch.bfloat16 and 1 <= x.shape[0] <= max_m:
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+            ll_bf16_gemm_kernel,
+        )
+
+        # The kernel object vLLM's warmup compiles for 1-16 rows (not
+        # ll_bf16_gemm's one-row PDL variant): nothing compiles during capture.
+        return ll_bf16_gemm_kernel(x.contiguous(), weight).to(torch.bfloat16)
+    return torch.nn.functional.linear(x, weight)
+
+
+def qwen_gdn_ba_proj_fake(
+    x: torch.Tensor, weight: torch.Tensor, max_m: int
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_ba_proj",
+    op_func=qwen_gdn_ba_proj,
+    fake_impl=qwen_gdn_ba_proj_fake,
+)
+
+
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
@@ -531,6 +592,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        # Experiment (VLLM_EXP_GDN_BA_LL_BF16=1): the b and a projection at a
+        # few rows from vLLM's cuteDSL ll_bf16_gemm, and its (K, N) for the
+        # kernel warmup (kernel_warmup.py), which compiles it before capture.
+        self._ba_ll_bf16_max_m = _gdn_ba_ll_bf16_max_m(self.in_proj_ba)
+        if self._ba_ll_bf16_max_m:
+            self.ll_bf16_warmup_shapes = (
+                (self.in_proj_ba.weight.shape[1], self.in_proj_ba.weight.shape[0]),
+            )
+            logger.info_once(
+                "Qwen GDN: the b and a projection from ll_bf16_gemm at 1-%d rows "
+                "(VLLM_EXP_GDN_BA_LL_BF16)",
+                self._ba_ll_bf16_max_m,
+            )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -993,7 +1067,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        if self._ba_ll_bf16_max_m:
+            ba = torch.ops.vllm.qwen_gdn_ba_proj(
+                hidden_states, self.in_proj_ba.weight, self._ba_ll_bf16_max_m
+            )
+        else:
+            ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
