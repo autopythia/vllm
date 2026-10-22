@@ -731,6 +731,38 @@ class FlashInferMetadata:
     Will be `None` if `num_decode_tokens == 0`.
     """
 
+    sm120_fp8_prefill: "SM120FP8Prefill | None" = None
+    """Experiment (VLLM_EXP_SM120_FP8_PREFILL=1): the prefill requests' K/V
+    rows in the flattened NHD cache and their offsets, for FlashInfer's SM120
+    FP8 attention kernel instead of FA2."""
+
+
+@dataclass
+class SM120FP8Prefill:
+    rows: torch.Tensor
+    """[total_kv] int64: block * page_size + offset of every K/V token of the
+    prefill requests, request after request."""
+    cu_seqlens_q: torch.Tensor
+    """[num_prefills + 1] int32, on the GPU."""
+    cu_seqlens_k: torch.Tensor
+    """[num_prefills + 1] int32, on the GPU."""
+    max_seqlen_q: int
+
+
+def _sm120_fp8_prefill_switch() -> bool:
+    """Experiment: FlashInfer's SM120 FP8 FMHA (cute-dsl-prims,
+    sm120_fmha_fp8_ragged_prefill: FP8 query, K and V, mma.sync m16n8k32) for
+    causal prefill on an FP8 KV cache on sm_12x, where vLLM otherwise runs FA2
+    with a BF16 query (FA2 cannot take an FP8 query). The kernel's paged form
+    needs compact 16-128-token pages, so the prefill requests' K/V rows are
+    gathered into contiguous tensors first (a transient copy per layer of
+    2 x kv_tokens x num_kv_heads x head_size bytes). The query is quantized per
+    tensor (its scale needs one host sync per layer). Up to
+    VLLM_EXP_SM120_FP8_PREFILL_MAX_KV K/V tokens per step (default 1,100,000)."""
+    import os
+
+    return os.environ.get("VLLM_EXP_SM120_FP8_PREFILL", "0") == "1"
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
@@ -986,6 +1018,64 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
         return self.cache_config.get_resolved_kv_cache_layout()
+
+    def _sm120_fp8_prefill(
+        self,
+        attn_metadata: "FlashInferMetadata",
+        qo_indptr_cpu: torch.Tensor,
+        paged_kv_indptr_cpu: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ) -> "SM120FP8Prefill | None":
+        """The prefill requests' K/V rows for the SM120 FP8 prefill experiment,
+        or None where it does not apply (then FA2 runs, as without it)."""
+        if not (
+            _sm120_fp8_prefill_switch()
+            and current_platform.is_device_capability_family(120)
+            and self.kv_cache_dtype in (torch.float8_e4m3fn,)
+            and attn_metadata.causal
+            and self.window_left == -1
+            and not self.logits_soft_cap
+            and not self.has_sinks
+            and self.head_dim in (64, 128, 256)
+            and get_flashinfer_layout_string(self.kv_cache_layout) == "NHD"
+        ):
+            return None
+        import os
+
+        kv_lens = kv_lens_cpu.to(torch.int64)
+        total_kv = int(kv_lens.sum())
+        max_kv = int(os.environ.get("VLLM_EXP_SM120_FP8_PREFILL_MAX_KV", "1100000"))
+        if total_kv == 0 or total_kv > max_kv:
+            return None
+        num_prefills = kv_lens.shape[0]
+        page = self.page_size
+        dev = self.device
+        cu_k_cpu = torch.zeros(num_prefills + 1, dtype=torch.int64)
+        cu_k_cpu[1:] = torch.cumsum(kv_lens, 0)
+        cu_k = cu_k_cpu.to(dev, non_blocking=True)
+        indptr = (
+            paged_kv_indptr_cpu[:num_prefills]
+            .to(torch.int64)
+            .to(dev, non_blocking=True)
+        )
+        req = torch.repeat_interleave(
+            torch.arange(num_prefills, device=dev),
+            kv_lens.to(dev, non_blocking=True),
+            output_size=total_kv,
+        )
+        pos = torch.arange(total_kv, device=dev) - cu_k[req]
+        blocks = paged_kv_indices[
+            indptr[req] + torch.div(pos, page, rounding_mode="floor")
+        ]
+        rows = blocks.to(torch.int64) * page + torch.remainder(pos, page)
+        q_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+        return SM120FP8Prefill(
+            rows=rows,
+            cu_seqlens_q=qo_indptr_cpu.to(torch.int32).to(dev, non_blocking=True),
+            cu_seqlens_k=cu_k.to(torch.int32),
+            max_seqlen_q=int(q_lens.max()),
+        )
 
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
@@ -1705,6 +1795,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
                     )
+                    attn_metadata.sm120_fp8_prefill = self._sm120_fp8_prefill(
+                        attn_metadata,
+                        qo_indptr_prefill_cpu,
+                        paged_kv_indptr_prefill_cpu,
+                        paged_kv_indices,
+                        kv_lens_prefill_cpu,
+                    )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
@@ -2002,6 +2099,47 @@ class FlashInferImpl(AttentionImpl):
 
         return query
 
+    def _sm120_fp8_prefill_run(
+        self,
+        layer: torch.nn.Module,
+        meta: SM120FP8Prefill,
+        prefill_query: torch.Tensor,
+        kv_cache_permute: torch.Tensor,
+        out_prefill: torch.Tensor,
+    ) -> None:
+        """Experiment (VLLM_EXP_SM120_FP8_PREFILL=1): causal prefill with
+        FlashInfer's SM120 FP8 FMHA on the prefill requests' K/V, gathered from
+        the NHD cache [blocks, page, kv_heads, 2 * head_size] (K and V packed
+        in the content dim) into contiguous tensors; the query quantized to
+        FP8 with a per-tensor scale (one host sync per layer)."""
+        from flashinfer.attention.cute_dsl.sm120_fmha import (
+            sm120_fmha_fp8_ragged_prefill,
+        )
+
+        hs = self.head_size
+        num_blocks, page, num_kv_heads, content = kv_cache_permute.shape
+        flat = kv_cache_permute.reshape(num_blocks * page, num_kv_heads, content)
+        key = torch.index_select(flat[:, :, :hs], 0, meta.rows)
+        value = torch.index_select(flat[:, :, hs:], 0, meta.rows)
+        n = prefill_query.shape[0]
+        query = prefill_query.reshape(n, self.num_heads, hs)
+        q_scale = query.abs().amax().float().clamp(min=1e-6) / 448.0
+        query_fp8 = (query.float() / q_scale).to(torch.float8_e4m3fn)
+        with gpu_sync_allowed():
+            q_scale_float = float(q_scale)
+        sm120_fmha_fp8_ragged_prefill(
+            query_fp8,
+            key,
+            value,
+            out_prefill.view(n, self.num_heads, hs),
+            meta.cu_seqlens_q,
+            meta.cu_seqlens_k,
+            max_seqlen_q=meta.max_seqlen_q,
+            is_causal=True,
+            sm_scale=self.scale * q_scale_float * layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -2258,6 +2396,18 @@ class FlashInferImpl(AttentionImpl):
                             self.scale * layer._q_scale_float * layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
+                        )
+                    elif (
+                        attn_metadata.sm120_fp8_prefill is not None
+                        and not self.is_kvcache_nvfp4
+                        and kv_cache_permute.dtype == torch.float8_e4m3fn
+                    ):
+                        self._sm120_fp8_prefill_run(
+                            layer,
+                            attn_metadata.sm120_fp8_prefill,
+                            prefill_query,
+                            kv_cache_permute,
+                            out_prefill,
                         )
                     else:
                         prefill_wrapper.run(
