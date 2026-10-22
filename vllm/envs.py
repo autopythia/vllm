@@ -2510,4 +2510,11 @@ def compile_factors() -> dict[str, object]:
     for var in ray_noset_env_vars:
         factors[var] = normalize_value(os.getenv(var))
 
+    # Experiment switches (VLLM_EXP_*, not known to this module) can change the
+    # traced graph. Hash the ones that are set, so that a graph compiled (and
+    # cached) without a switch is not reused with it, or the other way round.
+    for var in sorted(os.environ):
+        if var.startswith("VLLM_EXP_"):
+            factors[var] = os.environ[var]
+
     return factors
