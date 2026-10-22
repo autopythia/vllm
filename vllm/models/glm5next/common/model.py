@@ -778,8 +778,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # (as vLLM does for multimodal towers): with --cpu-offload-gb and
             # --cpu-offload-params embed_tokens the table stays in pinned host
             # memory (UVA) and a lookup reads hidden_size * 2 bytes per token.
+            # Experiment: VLLM_EXP_EMBED_ON_GPU=1 keeps this table on the GPU
+            # (the first stage's has room at 768k, ~1.2 GiB), while the MTP
+            # drafter's own copy on the last stage still follows the offload.
             offloader = get_offloader()
-            if offloader.supports_tower_offload:
+            if os.environ.get("VLLM_EXP_EMBED_ON_GPU", "0") == "1":
+                logger.info_once(
+                    "GLM-5.3: the embedding table stays on the GPU "
+                    "(VLLM_EXP_EMBED_ON_GPU)"
+                )
+            elif offloader.supports_tower_offload:
                 offloader.wrap_modules(iter([self.embed_tokens]), prefix="embed_tokens")
         else:
             self.embed_tokens = PPMissingLayer()
