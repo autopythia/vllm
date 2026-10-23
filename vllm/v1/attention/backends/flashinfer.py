@@ -1004,6 +1004,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.kv_cache_dtype,
             arch,
         )
+        if _sm120_fp8_prefill_switch():
+            why = self._sm120_fp8_prefill_unsupported()
+            if why is None:
+                logger.info_once(
+                    "FlashInfer: causal prefill by the SM120 FP8 FMHA, an FP8 "
+                    "query on the FP8 KV cache (VLLM_EXP_SM120_FP8_PREFILL)"
+                )
+            else:
+                logger.warning_once(
+                    "VLLM_EXP_SM120_FP8_PREFILL=1 has no effect: %s", why
+                )
         # Preparing persistent buffers
         self.paged_kv_indptr = CpuGpuBuffer(
             max_num_reqs + 1, dtype=torch.int32, device=self.device, pin_memory=False
@@ -1019,6 +1030,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def kv_cache_layout(self) -> KVCacheLayout:
         return self.cache_config.get_resolved_kv_cache_layout()
 
+    def _sm120_fp8_prefill_unsupported(self) -> str | None:
+        """Why the SM120 FP8 prefill experiment cannot run with this
+        configuration, or None if it can (each batch is checked as well)."""
+        if not current_platform.is_device_capability_family(120):
+            return "the GPU is not sm_12x"
+        if self.kv_cache_dtype not in (torch.float8_e4m3fn,):
+            return f"the KV cache is {self.kv_cache_dtype}, not FP8 (e4m3)"
+        if self.window_left != -1:
+            return "sliding-window attention"
+        if self.logits_soft_cap:
+            return "a logits soft cap"
+        if self.has_sinks:
+            return "attention sinks"
+        if self.head_dim not in (64, 128, 256):
+            return f"head size {self.head_dim}, not 64, 128 or 256"
+        layout = get_flashinfer_layout_string(self.kv_cache_layout)
+        if layout != "NHD":
+            return f"the KV cache layout {layout}, not NHD"
+        return None
+
     def _sm120_fp8_prefill(
         self,
         attn_metadata: "FlashInferMetadata",
@@ -1031,14 +1062,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         or None where it does not apply (then FA2 runs, as without it)."""
         if not (
             _sm120_fp8_prefill_switch()
-            and current_platform.is_device_capability_family(120)
-            and self.kv_cache_dtype in (torch.float8_e4m3fn,)
             and attn_metadata.causal
-            and self.window_left == -1
-            and not self.logits_soft_cap
-            and not self.has_sinks
-            and self.head_dim in (64, 128, 256)
-            and get_flashinfer_layout_string(self.kv_cache_layout) == "NHD"
+            and self._sm120_fp8_prefill_unsupported() is None
         ):
             return None
         import os
