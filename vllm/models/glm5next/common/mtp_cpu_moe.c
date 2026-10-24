@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -137,6 +138,7 @@ typedef struct {
 
 struct cmoe {
   int E, topk, max_rows, max_sel, T, pf, spin_us, nstarted, wbits, pf_hint;
+  int shallow_us, poll_ns;   /* experiment: idle workers poll with short sleeps (see worker_main) */
   float limit;
   worker_t *W;
   uint8_t *map13, *map2; size_t len13, len2;
@@ -465,13 +467,22 @@ static void *worker_main(void *arg) {
     if (!w->s13 || !w->s2) { free(w->acc); w->acc = NULL; }   /* reported as out of memory by cmoe_create */
   }
   atomic_fetch_add_explicit(&c->nready, 1, memory_order_acq_rel);
+  /* Idle workers spin for spin_us, then (experiment, VLLM_EXP_MTP_CPU_MOE_SHALLOW_US) poll with sleeps of poll_ns
+   * for shallow_us more, then sleep on a futex. A futex sleep between decode steps lets the core reach its deepest
+   * idle state (C6P on the Xeon 6767P, 210 us to leave), and a call then waits for the slowest worker to wake; a
+   * short sleep's near timer keeps the idle governor in C1/C1E (1-4 us). Exact timer slack for these sleeps. */
+  if (c->shallow_us > 0) prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
   for (;;) {
     int g;
     double t_spin = now();
     while ((g = atomic_load_explicit(&c->go_gen, memory_order_acquire)) == seen) {
-      if (now() - t_spin > c->spin_us * 1e-6) {
+      const double idle = now() - t_spin;
+      if (idle > (c->spin_us + c->shallow_us) * 1e-6) {
         futex(&c->go_gen, FUTEX_WAIT_PRIVATE, seen); /* woken by a call, or by a prewake (then spin again) */
         t_spin = now();
+      } else if (idle > c->spin_us * 1e-6) {
+        const struct timespec ts = {0, c->poll_ns};
+        nanosleep(&ts, NULL);
       } else {
         _mm_pause();
       }
@@ -529,6 +540,13 @@ cmoe_t *cmoe_create(int n_experts, int top_k, int max_rows, const int *cpus, int
   if (!c) { set_err("out of memory"); return NULL; }
   c->E = n_experts; c->topk = top_k; c->max_rows = max_rows; c->max_sel = max_rows * top_k; c->T = n_threads;
   c->pf = prefetch_bytes; c->spin_us = spin_us; c->limit = swiglu_limit; c->wbits = wbits;
+  {
+    const char *e = getenv("VLLM_EXP_MTP_CPU_MOE_SHALLOW_US"), *p = getenv("VLLM_EXP_MTP_CPU_MOE_POLL_US");
+    c->shallow_us = e ? atoi(e) : 0;
+    c->poll_ns = (p ? atoi(p) : 50) * 1000;
+    if (c->shallow_us < 0) c->shallow_us = 0;
+    if (c->poll_ns < 1000) c->poll_ns = 1000;
+  }
   pthread_mutex_init(&c->call_lock, NULL);
   c->W = calloc(n_threads, sizeof(worker_t));
   c->rows_list = calloc(max_rows, sizeof(int)); c->comp = calloc(max_rows, sizeof(int));
