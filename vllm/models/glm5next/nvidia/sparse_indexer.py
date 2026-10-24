@@ -186,22 +186,34 @@ _DET_TOPK_BLOCK = 1024
 
 
 @triton.jit
+def _det_topk_key(x):
+    """Order-preserving integer key of a float32 logit, ranking like
+    torch.topk: every NaN above +inf (canonical NaN), -0.0 equal to +0.0."""
+    x = tl.where(x != x, float("nan"), x + 0.0)  # +0.0 folds -0.0 into +0.0
+    bits = x.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    return tl.where(bits >= 0x80000000, 0xFFFFFFFF - bits, bits + 0x80000000)
+
+
+@triton.jit
 def _det_topk_threshold(
     logits_row, sel_row, start, end, k, RELATIVE: tl.constexpr, KP2: tl.constexpr
 ):
-    """The smallest logit among a row's selection (+inf if it is empty)."""
+    """The smallest key among a row's selection (2^32, above every key, if it
+    is empty)."""
     kk = tl.arange(0, KP2)
     sel = tl.load(sel_row + kk, mask=kk < k, other=-1).to(tl.int64)
     col = sel + start if RELATIVE else sel
     valid = (kk < k) & (sel >= 0) & (col >= start) & (col < end)
-    vals = tl.load(logits_row + col, mask=valid, other=float("inf"))
-    return tl.min(vals, axis=0)
+    vals = tl.load(logits_row + col, mask=valid, other=0.0)
+    keys = tl.where(valid, _det_topk_key(vals), 0x100000000)
+    return tl.min(keys, axis=0)
 
 
 @triton.jit
 def _det_topk_masks(x, m, t, DROP_NEG_INF: tl.constexpr):
-    gt = m & (x > t)
-    eq = m & (x == t)
+    kx = _det_topk_key(x)
+    gt = m & (kx > t)
+    eq = m & (kx == t)
     if DROP_NEG_INF:
         gt = gt & (x != float("-inf"))
         eq = eq & (x != float("-inf"))
@@ -396,7 +408,7 @@ def _deterministic_topk_compact_(
             KP2=triton.next_power_of_2(k), **flags,
         )
     else:
-        t = torch.empty(rows, dtype=torch.float32, device=logits.device)
+        t = torch.empty(rows, dtype=torch.int64, device=logits.device)
         cnt = torch.empty(rows, n_chunks, 2, dtype=torch.int32, device=logits.device)
         _det_topk_count_kernel[(rows, n_chunks)](
             logits, logits.stride(0), starts, row_ends, out, t, cnt, k, n_chunks,
