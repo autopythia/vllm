@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -104,6 +106,30 @@ class GateLinear(ReplicatedLinear):
         can_use_specialized_kernels &= self.is_unquantized
 
         self.allow_specialized_router_gemm = can_use_specialized_kernels
+        # Experiment: tier 1 (cuteDSL ll_bf16_gemm) on the RTX Blackwell family
+        # (sm_120) too, where the gate above leaves it off although the kernel
+        # runs there; VLLM_EXP_ROUTER_LL_BF16_SM120=1 opts in. On sm_120 it
+        # beats cuBLAS only in its dot-product range (M <= 4), so it is used up
+        # to VLLM_EXP_ROUTER_LL_BF16_MAX_M rows (default 4). The other
+        # specialized tiers stay off on sm_120.
+        self._ll_bf16_sm120 = (
+            os.environ.get("VLLM_EXP_ROUTER_LL_BF16_SM120", "0") == "1"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and self.is_unquantized
+            and not bias
+        )
+        self._ll_bf16_max_tokens = self.LL_BF16_MAX_TOKENS
+        if self._ll_bf16_sm120:
+            self._ll_bf16_max_tokens = min(
+                self.LL_BF16_MAX_TOKENS,
+                int(os.environ.get("VLLM_EXP_ROUTER_LL_BF16_MAX_M") or 4),
+            )
+            logger.info_once(
+                "GateLinear: cuteDSL ll_bf16_gemm on sm_120 for up to %d rows "
+                "(VLLM_EXP_ROUTER_LL_BF16_SM120=1).",
+                self._ll_bf16_max_tokens,
+            )
 
         # fp32 specialized kernel eligibility (exact dims, fp32 weight)
         self.allow_fp32_router_gemm = (
@@ -176,7 +202,7 @@ class GateLinear(ReplicatedLinear):
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
-        if can_use_specialized_kernels:
+        if can_use_specialized_kernels or self._ll_bf16_sm120:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -209,7 +235,7 @@ class GateLinear(ReplicatedLinear):
             self._rocm_bf16x3_weight_eligible and out_dtype == torch.float32
         )
 
-        if self.allow_specialized_router_gemm:
+        if self.allow_specialized_router_gemm or self._ll_bf16_sm120:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -231,7 +257,7 @@ class GateLinear(ReplicatedLinear):
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if (
             self.allow_ll_bf16_gemm
-            and x.shape[0] <= self.LL_BF16_MAX_TOKENS
+            and x.shape[0] <= self._ll_bf16_max_tokens
             and x.dtype == torch.bfloat16
         ):
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
